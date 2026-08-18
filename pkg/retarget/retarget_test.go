@@ -7,11 +7,9 @@ import (
 	"testing"
 )
 
-// buildProbe monta uma imagem de fundo branco com um bloco saliente (linha)
-// e devolve também a máscara protegendo apenas esse bloco.
-func buildProbe(w, h, bx0, by0, bw, bh int) (image.Image, image.Image) {
+// buildProbe monta uma imagem de fundo branco com um bloco saliente (linha).
+func buildProbe(w, h, bx0, by0, bw, bh int) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	mask := image.NewGray(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			img.Set(x, y, color.RGBA{R: 240, G: 240, B: 240, A: 255})
@@ -20,13 +18,12 @@ func buildProbe(w, h, bx0, by0, bw, bh int) (image.Image, image.Image) {
 	for y := by0; y < by0+bh; y++ {
 		for x := bx0; x < bx0+bw; x++ {
 			img.Set(x, y, color.RGBA{R: 10, G: 10, B: 10, A: 255})
-			mask.SetGray(x, y, color.Gray{Y: 255})
 		}
 	}
-	return img, mask
+	return img
 }
 
-// blockBounds localiza o retângulo de pixels não-brancos (o bloco protegido).
+// blockBounds localiza o retângulo de pixels não-brancos (o bloco saliente).
 func blockBounds(img image.Image) (x0, y0, x1, y1 int) {
 	b := img.Bounds()
 	x0, y0, x1, y1 = 1<<30, 1<<30, -1, -1
@@ -52,56 +49,53 @@ func blockBounds(img image.Image) (x0, y0, x1, y1 int) {
 	return
 }
 
-// TestCoverCropPreservaAspecto garante que, ao mudar o aspect ratio, o bloco
-// saliente mantém o aspecto (escala uniforme, sem shear/stretch) e permanece
-// dentro da janela de crop (não é cortado).
-func TestCoverCropPreservaAspecto(t *testing.T) {
-	// Origem 600x900; destino 800x700 (aspecto muda). Bloco 120x240 centrado.
-	img, mask := buildProbe(600, 900, 240, 330, 120, 240)
-	out := Fit(img, mask, 800, 700)
+// TestFitCabeSemCrop garante que, ao mudar o aspect ratio, o bloco permanece
+// intacto (nada é cortado) e o aspect ratio da página é preservado.
+func TestFitCabeSemCrop(t *testing.T) {
+	// Origem 600x900 (aspecto 2:3); alvo 800x700 (aspecto diferente).
+	img := buildProbe(600, 900, 240, 330, 120, 240)
+	out := Fit(img, 800, 700)
 
-	if out.Bounds().Dx() != 800 || out.Bounds().Dy() != 700 {
+	// Escala = min(800/600, 700/900) = min(1.333, 0.778) = 0.778 → 467x700.
+	if out.Bounds().Dx() != 467 || out.Bounds().Dy() != 700 {
 		t.Fatalf("dimensão do resultado errada: %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
 	}
 
+	// O bloco inteiro continua presente (nada foi cortado).
 	x0, y0, x1, y1 := blockBounds(out)
-	if x0 < 0 || y0 < 0 || x1 >= 800 || y1 >= 700 {
-		t.Fatalf("bloco cortado pelo crop: (%d,%d)-(%d,%d)", x0, y0, x1, y1)
+	if x0 < 0 || y0 < 0 || x1 >= out.Bounds().Dx() || y1 >= out.Bounds().Dy() {
+		t.Fatalf("bloco cortado: (%d,%d)-(%d,%d)", x0, y0, x1, y1)
 	}
-	gotW, gotH := float64(x1-x0+1), float64(y1-y0+1)
-	gotAspect := gotW / gotH
+
+	// Aspecto do bloco preservado (escala uniforme, sem shear).
+	gotAspect := float64(x1-x0+1) / float64(y1-y0+1)
 	wantAspect := 120.0 / 240.0
-	t.Logf("bloco resultante: %.0fx%.0f (aspecto %.3f, esperado %.3f)", gotW, gotH, gotAspect, wantAspect)
+	t.Logf("bloco resultante: %dx%d (aspecto %.3f, esperado %.3f)", x1-x0+1, y1-y0+1, gotAspect, wantAspect)
 	if math.Abs(gotAspect-wantAspect) > 0.05 {
 		t.Errorf("aspecto do bloco não preservado: got=%.3f want=%.3f", gotAspect, wantAspect)
 	}
 }
 
-// TestFitMesmoAspect usa interpolação simples (sem retargeting) quando o
-// aspect ratio não muda.
+// TestFitMesmoAspect: quando o aspect coincide com o alvo, o resultado tem
+// exatamente dstW x dstH (sem barras).
 func TestFitMesmoAspect(t *testing.T) {
-	img, _ := buildProbe(600, 900, 240, 330, 120, 240)
-	out := Fit(img, nil, 400, 600) // mesmo aspect ratio 2:3
+	img := buildProbe(600, 900, 240, 330, 120, 240)
+	out := Fit(img, 400, 600) // mesmo aspect ratio 2:3
 	if out.Bounds().Dx() != 400 || out.Bounds().Dy() != 600 {
 		t.Fatalf("dimensão errada: %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
 	}
 }
 
-// TestFitSemMascara apenas redimensiona.
-func TestFitSemMascara(t *testing.T) {
-	img, _ := buildProbe(600, 900, 240, 330, 120, 240)
-	out := Fit(img, nil, 800, 700)
-	if out.Bounds().Dx() != 800 || out.Bounds().Dy() != 700 {
-		t.Fatalf("dimensão errada: %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
+// TestFitNaoUpscale: se a origem já cabe no alvo, não amplia (apenas ajusta para
+// o maior tamanho possível sem ultrapassar o alvo).
+func TestFitNaoExcedeAlvo(t *testing.T) {
+	img := buildProbe(600, 900, 240, 330, 120, 240)
+	out := Fit(img, 1000, 1200) // alvo maior que a origem
+	if out.Bounds().Dx() > 1000 || out.Bounds().Dy() > 1200 {
+		t.Fatalf("excedeu o alvo: %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
 	}
-}
-
-// TestSameAspect verifica a tolerância do comparador.
-func TestSameAspect(t *testing.T) {
-	if !SameAspect(600, 900, 400, 600) {
-		t.Error("600x900 e 400x600 têm o mesmo aspect ratio")
-	}
-	if SameAspect(600, 900, 800, 700) {
-		t.Error("600x900 e 800x700 têm aspects diferentes")
+	// Não ultrapassa o alvo e preserva o aspect 2:3.
+	if out.Bounds().Dx() != 800 || out.Bounds().Dy() != 1200 {
+		t.Fatalf("escala errada: %dx%d (esperado 800x1200)", out.Bounds().Dx(), out.Bounds().Dy())
 	}
 }

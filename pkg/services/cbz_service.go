@@ -16,7 +16,6 @@ import (
 
 	"cbz-converter/pkg/esrgan"
 	"cbz-converter/pkg/retarget"
-	"cbz-converter/pkg/yolo"
 	"github.com/wailsapp/wails/v3/pkg/application"
 
 	// Decoders extras para formatos de imagem suportados (webp, bmp, tiff, gif)
@@ -174,17 +173,6 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 	}
 	s.emitProgress(CBZProgress{Stage: "Preparando", Message: "Inferência em " + mode})
 
-	// Detector YOLO (opcional): identifica personagens/objetos para gerar uma
-	// máscara de proteção ao retargeting. Se falhar, segue sem máscara.
-	var det *yolo.Detector
-	if d, err := yolo.New(); err == nil {
-		det = d
-		defer det.Close()
-		s.emitProgress(CBZProgress{Stage: "Preparando", Message: "Detector YOLO carregado"})
-	} else {
-		s.emitProgress(CBZProgress{Stage: "Preparando", Message: "Detector YOLO indisponível — sem máscara de proteção"})
-	}
-
 	// Reutiliza a extração para obter as páginas na pasta temporária
 	extracted, err := s.UnpackCBZ(fileName, fileData)
 	if err != nil {
@@ -256,18 +244,9 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 			action := "ajustando resolução"
 			srcW, srcH := img.Bounds().Dx(), img.Bounds().Dy()
 
-			// Máscara de proteção (opcional): detecta personagens/objetos e marca
-			// as regiões que o retargeting deve preservar.
-			var mask image.Image
-			if det != nil {
-				if boxes, err := det.Detect(img); err == nil {
-					mask = det.BuildMask(srcW, srcH, 6, boxes)
-				}
-			}
-
 			if width > srcW || height > srcH {
 				// Resolução alvo maior que a do arquivo: Real-ESRGAN (4x) para
-				// upscaling e depois retargeting para atingir a resolução final.
+				// upscaling e depois ajuste para caber na resolução final.
 				action = "melhorando qualidade"
 				w := <-free
 				upscaled, err := esr.UpscaleOne(img, w)
@@ -280,10 +259,10 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 					mu.Unlock()
 					return
 				}
-				resized = retarget.Fit(upscaled, mask, width, height)
+				resized = retarget.Fit(upscaled, width, height)
 			} else {
-				// Resolução alvo menor ou igual à do arquivo: retargeting direto.
-				resized = retarget.Fit(img, mask, width, height)
+				// Resolução alvo menor ou igual à do arquivo: ajuste direto.
+				resized = retarget.Fit(img, width, height)
 			}
 
 			results[i] = resized

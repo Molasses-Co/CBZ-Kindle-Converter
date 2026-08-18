@@ -82,10 +82,8 @@ wails3 build
 - `pkg/real_esrgan_general_x4v3-onnx-w8a8/` — modelo embutido via `go:embed`
   (quantizado w8a8, uint8; `.onnx` + pesos externos `.data`; ambos são gravados
   em disco no mesmo diretório antes de onnxruntime carregar).
-- `pkg/yolo/` — detecção de objetos (YOLOv8n ONNX embutido no pacote) para gerar
-  uma máscara de proteção que guia o retargeting (preserva personagens/objetos).
-- `pkg/retarget/` — ajuste à resolução alvo (escala uniforme + crop com janela
-  centrada na saliência, inclinada pela máscara de proteção).
+- `pkg/retarget/` — ajuste à resolução alvo: trata o alvo como limite máximo e
+  redimensiona a página uniformemente para caber nele (sem crop, sem barras).
 - `pkg/ortdll/` — embute `onnxruntime.dll` (DirectML) no executável e extrai em
   runtime, tornando o app autocontido (sem DLLs ao lado).
 - `frontend/` — UI em React/TS; `App.tsx` orquestra o fluxo e chama o backend
