@@ -12,6 +12,8 @@ import (
 	"math"
 	"runtime"
 	"sync"
+
+	"golang.org/x/image/draw"
 )
 
 var forward = true
@@ -24,15 +26,14 @@ var (
 
 var (
 	shieldEnabled  = true
-	shieldStrength = float32(10)
+	shieldStrength = float32(4)
 )
 
 const (
 	protectCost     float32 = 1e7
 	maxCost         float32 = 1e20
 	edgeWeight      float32 = 8
-	centerCost      float32 = 24
-	orientWeight    float32 = 4
+	centerCost      float32 = 4
 	protectCrossThr float32 = 0.5
 	maxWorkers              = 8
 )
@@ -60,6 +61,12 @@ func Resize(src image.Image, width, height int) image.Image {
 // ResizeWithMask accepts a soft protection mask. Black means no additional
 // protection and white means strongly protected. Mask bounds need not start at
 // (0,0); masks of another size are sampled proportionally.
+//
+// When the mask marks connected protected components, a hybrid strategy is used:
+// the protected objects are extracted and rescaled with uniform (bicubic)
+// interpolation, while seam carving runs only on the background. This
+// guarantees a long diagonal protected object (e.g. a sickle handle) is never
+// sheared by seams alternating which side they route around.
 func ResizeWithMask(src, mask image.Image, width, height int) image.Image {
 	if src == nil || width <= 0 || height <= 0 {
 		return src
@@ -68,6 +75,15 @@ func ResizeWithMask(src, mask image.Image, width, height int) image.Image {
 	if p.w == 0 || p.h == 0 {
 		return src
 	}
+	if comps := protectedComponents(p.protect, p.w, p.h, protectCrossThr); len(comps) > 0 {
+		return hybridResize(p, src, width, height, comps)
+	}
+	return carvePlanes(p, width, height)
+}
+
+// carvePlanes runs the one-seam-at-a-time seam carving on the given planes and
+// returns the resized image (applying the levels filter at the end).
+func carvePlanes(p *planes, width, height int) image.Image {
 	p.resizeWidth(width)
 	p.transpose()
 	p.resizeWidth(height)
@@ -123,6 +139,166 @@ func sampleMask(mask image.Image, x, y, dstW, dstH int) float32 {
 	return float32(v) / 255
 }
 
+// component is the bounding box of a connected protected region.
+type component struct{ x0, y0, x1, y1 int }
+
+// protectedComponents flood-fills connected protected components (4-connectivity)
+// and returns their bounding boxes.
+func protectedComponents(protect []float32, w, h int, thr float32) []component {
+	visited := make([]bool, w*h)
+	var comps []component
+	for start := 0; start < w*h; start++ {
+		if visited[start] || protect[start] < thr {
+			continue
+		}
+		stack := []int{start}
+		visited[start] = true
+		minX, maxX := start%w, start%w
+		minY, maxY := start/w, start/w
+		for len(stack) > 0 {
+			i := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			x, y := i%w, i/w
+			if x < minX {
+				minX = x
+			}
+			if x > maxX {
+				maxX = x
+			}
+			if y < minY {
+				minY = y
+			}
+			if y > maxY {
+				maxY = y
+			}
+			for _, d := range [4]int{-1, 1, -w, w} {
+				j := i + d
+				if j < 0 || j >= w*h {
+					continue
+				}
+				if (i%w == 0 && d == -1) || (i%w == w-1 && d == 1) {
+					continue
+				}
+				if visited[j] || protect[j] < thr {
+					continue
+				}
+				visited[j] = true
+				stack = append(stack, j)
+			}
+		}
+		comps = append(comps, component{minX, minY, maxX + 1, maxY + 1})
+	}
+	return comps
+}
+
+// backgroundPlanes returns a copy of p with protected pixels replaced by the
+// average background color, so seam carving treats the object region as
+// structureless background.
+func (p *planes) backgroundPlanes(thr float32) *planes {
+	ar, ag, ab := p.averageBackground(thr)
+	q := &planes{w: p.w, h: p.h}
+	n := p.w * p.h
+	q.gray, q.protect = make([]float32, n), make([]float32, n)
+	q.r, q.g, q.b, q.a = make([]uint8, n), make([]uint8, n), make([]uint8, n), make([]uint8, n)
+	for i := 0; i < n; i++ {
+		q.r[i], q.g[i], q.b[i], q.a[i] = p.r[i], p.g[i], p.b[i], p.a[i]
+		if p.protect[i] >= thr {
+			q.r[i], q.g[i], q.b[i] = ar, ag, ab
+		}
+		q.gray[i] = luma(q.r[i], q.g[i], q.b[i])
+	}
+	return q
+}
+
+// averageBackground returns the mean RGB of the non-protected pixels.
+func (p *planes) averageBackground(thr float32) (uint8, uint8, uint8) {
+	var r, g, b, n uint64
+	for i := range p.r {
+		if p.protect[i] >= thr {
+			continue
+		}
+		r += uint64(p.r[i])
+		g += uint64(p.g[i])
+		b += uint64(p.b[i])
+		n++
+	}
+	if n == 0 {
+		return 255, 255, 255
+	}
+	return uint8(r / n), uint8(g / n), uint8(b / n)
+}
+
+// hybridResize carves only the background to the target size, then rescales each
+// protected object uniformly (bicubic) and composites it back at the position
+// scaled proportionally to the target.
+func hybridResize(p *planes, src image.Image, width, height int, comps []component) image.Image {
+	srcW, srcH := p.w, p.h
+	bg := carvePlanes(p.backgroundPlanes(protectCrossThr), width, height).(*image.RGBA)
+
+	for _, c := range comps {
+		cw, ch := c.x1-c.x0, c.y1-c.y0
+		if cw <= 0 || ch <= 0 {
+			continue
+		}
+		dw := cw * width / srcW
+		dh := ch * height / srcH
+		if dw < 1 {
+			dw = 1
+		}
+		if dh < 1 {
+			dh = 1
+		}
+		obj := crop(src, c.x0, c.y0, c.x1, c.y1)
+		scaled := image.NewRGBA(image.Rect(0, 0, dw, dh))
+		draw.CatmullRom.Scale(scaled, scaled.Bounds(), obj, obj.Bounds(), draw.Over, nil)
+		if levelsEnabled {
+			applyLevelsRGBA(scaled, blackPoint, whitePoint)
+		}
+		px := c.x0 * width / srcW
+		py := c.y0 * height / srcH
+		r := image.Rect(px, py, px+dw, py+dh)
+		sp := image.Point{0, 0}
+		if r.Min.X < 0 {
+			sp.X = -r.Min.X
+			r.Min.X = 0
+		}
+		if r.Min.Y < 0 {
+			sp.Y = -r.Min.Y
+			r.Min.Y = 0
+		}
+		if r.Max.X > bg.Bounds().Max.X {
+			r.Max.X = bg.Bounds().Max.X
+		}
+		if r.Max.Y > bg.Bounds().Max.Y {
+			r.Max.Y = bg.Bounds().Max.Y
+		}
+		if !r.Empty() {
+			draw.Draw(bg, r, scaled, sp, draw.Over)
+		}
+	}
+	return bg
+}
+
+func crop(src image.Image, x0, y0, x1, y1 int) *image.RGBA {
+	b := src.Bounds()
+	r := image.Rect(b.Min.X+x0, b.Min.Y+y0, b.Min.X+x1, b.Min.Y+y1)
+	dst := image.NewRGBA(image.Rect(0, 0, x1-x0, y1-y0))
+	draw.Draw(dst, dst.Bounds(), src, r.Min, draw.Src)
+	return dst
+}
+
+func applyLevelsRGBA(img *image.RGBA, black, white float32) {
+	if white <= black {
+		return
+	}
+	rng := white - black
+	for i := 0; i < len(img.Pix); i += 4 {
+		img.Pix[i] = level(img.Pix[i], black, rng)
+		img.Pix[i+1] = level(img.Pix[i+1], black, rng)
+		img.Pix[i+2] = level(img.Pix[i+2], black, rng)
+	}
+}
+
 func (p *planes) resizeWidth(target int) {
 	if target <= 0 || target == p.w {
 		return
@@ -150,21 +326,46 @@ func (p *planes) resizeWidth(target int) {
 // prevents a batch of seams from collectively cutting through a thin object.
 // If the lowest-cost seam crosses a strongly protected region, a second pass
 // that hard-forbids protected pixels is attempted so the cut routes around the
-// protected subject whenever an unobstructed path exists.
+// protected subject whenever an unobstructed, finite-cost path exists.
 func (p *planes) findSeam() []int32 {
 	energy := p.energy()
-	var seam []int32
-	if forward {
-		seam = forwardSeam(p.gray, energy, p.w, p.h)
-	} else {
-		seam = backwardSeam(energy, p.w, p.h)
+	seam := p.bestSeam(energy)
+	if !p.crossesProtection(seam) {
+		return seam
 	}
-	if p.crossesProtection(seam) {
-		if alt := p.avoidProtectionSeam(); len(alt) > 0 && !p.crossesProtection(alt) {
-			seam = alt
+
+	hard := p.energy()
+	for i := range hard {
+		if p.protect[i] >= protectCrossThr {
+			hard[i] = maxCost
 		}
 	}
+	if alt, finite := p.bestSeamCost(hard); finite && !p.crossesProtection(alt) {
+		return alt
+	}
+
+	// Se não existe caminho livre de proteção, prefira a seam original de menor
+	// custo em vez de uma rota arbitrária saturada.
 	return seam
+}
+
+func (p *planes) bestSeam(energy []float32) []int32 {
+	if forward {
+		return forwardSeam(p.gray, energy, p.w, p.h)
+	}
+	return backwardSeam(energy, p.w, p.h)
+}
+
+// bestSeamCost returns the best seam and whether it stays finite throughout
+// (never touches a pixel hard-forbidden with maxCost).
+func (p *planes) bestSeamCost(energy []float32) ([]int32, bool) {
+	seam := p.bestSeam(energy)
+	for y, sx := range seam {
+		if energy[y*p.w+int(sx)] >= maxCost {
+			return nil, false
+		}
+	}
+	return seam, true
 }
 
 // crossesProtection reports whether the seam passes over any strongly protected
@@ -176,28 +377,6 @@ func (p *planes) crossesProtection(seam []int32) bool {
 		}
 	}
 	return false
-}
-
-// avoidProtectionSeam computes a seam treating protected pixels as hard-forbidden
-// (cost = maxCost). It returns nil if no seam avoids them (i.e. every path must
-// cross the protected region).
-func (p *planes) avoidProtectionSeam() []int32 {
-	energy := p.energy()
-	for i := range energy {
-		if p.protect[i] >= protectCrossThr {
-			energy[i] = maxCost
-		}
-	}
-	var seam []int32
-	if forward {
-		seam = forwardSeam(p.gray, energy, p.w, p.h)
-	} else {
-		seam = backwardSeam(energy, p.w, p.h)
-	}
-	if p.crossesProtection(seam) {
-		return nil
-	}
-	return seam
 }
 
 // energy returns an additive, finite cost map. Scharr magnitude captures line
@@ -234,9 +413,6 @@ func (p *planes) energy() []float32 {
 				}
 				mag := abs32(gx[i]) + abs32(gy[i])
 				v := mag + edgeWeight*local
-				// Orientation term: penalize cutting across vertical edges (a
-				// seam column that passes through a vertical edge severs it).
-				v += orientWeight * abs32(gx[i])
 				v += p.protect[i] * protectCost
 				v += centerPrior(p.w, p.h, x, y) * centerCost
 				out[i] = clampCost(v)
@@ -280,6 +456,10 @@ func parallelRows(h int, fn func(y0, y1 int)) {
 func forwardSeam(gray, salience []float32, w, h int) []int32 {
 	parent := make([]int32, w*h)
 	prev, next := make([]float32, w+2), make([]float32, w+2)
+
+	// Sentinels: transitions that would leave the image are invalid, never
+	// clamped. A boundary parent keeps cost maxCost so it is never preferred
+	// while a finite path exists.
 	prev[0], prev[w+1] = maxCost, maxCost
 	for x := 0; x < w; x++ {
 		left, right := gray[x], gray[x]
@@ -306,12 +486,12 @@ func forwardSeam(gray, salience []float32, w, h int) []int32 {
 			mid := abs32(right-left) + salience[i]
 			cl := mid + abs32(up-left)
 			cr := mid + abs32(up-right)
-			best, par := satAdd(prev[x], cl), int32(clampIdx(x-1, w))
+			best, par := satAdd(prev[x], cl), int32(x-1)
 			if v := satAdd(prev[x+1], mid); v < best {
 				best, par = v, int32(x)
 			}
 			if v := satAdd(prev[x+2], cr); v < best {
-				best, par = v, int32(clampIdx(x+1, w))
+				best, par = v, int32(x+1)
 			}
 			next[x+1], parent[i] = best, par
 		}
@@ -329,17 +509,18 @@ func forwardSeam(gray, salience []float32, w, h int) []int32 {
 func backwardSeam(energy []float32, w, h int) []int32 {
 	parent := make([]int32, w*h)
 	prev, next := make([]float32, w+2), make([]float32, w+2)
+
 	prev[0], prev[w+1] = maxCost, maxCost
 	copy(prev[1:w+1], energy[:w])
 	for y := 1; y < h; y++ {
 		next[0], next[w+1] = maxCost, maxCost
 		for x := 0; x < w; x++ {
-			best, par := prev[x], int32(clampIdx(x-1, w))
+			best, par := prev[x], int32(x-1)
 			if prev[x+1] < best {
 				best, par = prev[x+1], int32(x)
 			}
 			if prev[x+2] < best {
-				best, par = prev[x+2], int32(clampIdx(x+1, w))
+				best, par = prev[x+2], int32(x+1)
 			}
 			next[x+1], parent[y*w+x] = satAdd(best, energy[y*w+x]), par
 		}
@@ -358,7 +539,19 @@ func trace(parent []int32, w, h, end int) []int32 {
 	seam := make([]int32, h)
 	seam[h-1] = int32(end)
 	for y := h - 1; y > 0; y-- {
-		seam[y-1] = parent[y*w+int(seam[y])]
+		cur := int(seam[y])
+		// First row stores no parent.
+		if y == 1 {
+			seam[y-1] = int32(cur)
+			continue
+		}
+		p := parent[y*w+cur]
+		// Safety net: a parent outside [0,w) means a boundary sentinel leaked
+		// in; fall back to staying in the same column rather than an invalid one.
+		if p < 0 || p >= int32(w) {
+			p = int32(cur)
+		}
+		seam[y-1] = p
 	}
 	return seam
 }
@@ -501,15 +694,6 @@ func abs32(v float32) float32 {
 		return -v
 	}
 	return v
-}
-func clampIdx(i, w int) int {
-	if i < 0 {
-		return 0
-	}
-	if i >= w {
-		return w - 1
-	}
-	return i
 }
 func max32(a, b float32) float32 {
 	if a > b {
