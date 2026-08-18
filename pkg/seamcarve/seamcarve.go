@@ -1,556 +1,634 @@
-// Package seamcarve implements content-aware image resizing in pure Go.
+// Package seamcarve implementa seam carving em Go puro, usado para redimensionar
+// (reduzir ou expandir) uma imagem preservando o conteúdo importante via remoção
+// ou inserção de "costuras" (seams) de menor energia.
 //
-// This version favors preservation of illustrated objects and thin line art over
-// throughput: seams are removed/inserted one at a time and energy is recomputed
-// after every edit. The energy combines forward disruption, Scharr structure,
-// locally dilated edges, a soft protection mask, and an optional center prior.
+// É um port do algoritmo clássico (Avidan & Shamir) com energia forward
+// (melhor qualidade) e suporte a energia backward (gradiente Sobel). A redução
+// é feita em lotes (encontra N costuras de uma vez e remove todas juntas), o
+// que é bem mais rápido do que remover uma a uma.
 package seamcarve
 
 import (
 	"image"
 	"image/color"
 	"math"
-	"runtime"
-	"sync"
 )
 
+// forward define o tipo de energia usada: true = forward (default), false = backward.
 var forward = true
 
+// Parâmetros do filtro de níveis (contraste) aplicado ao final do Resize para
+// devolver pretos profundos e brancos puros (característico de mangá/HQ).
 var (
 	levelsEnabled = true
 	blackPoint    = float32(30)
 	whitePoint    = float32(225)
 )
 
+// Parâmetros do escudo central (center-weighted energy): protege o centro da
+// imagem (personagens/rostos) de serem "esmagados" pelo seam carving.
 var (
 	shieldEnabled  = true
-	shieldStrength = float32(10)
+	shieldStrength = 10.0
 )
 
-const (
-	protectCost     float32 = 1e7
-	maxCost         float32 = 1e20
-	edgeWeight      float32 = 8
-	centerCost      float32 = 24
-	orientWeight    float32 = 4
-	protectCrossThr float32 = 0.5
-	maxWorkers              = 8
-)
+// maskProtected é o multiplicador de energia aplicado a pixels marcados como
+// protegidos (branco) na máscara de proteção. Um valor enorme (~infinito)
+// impede que esses pixels sejam cortados.
+const maskProtected = 1e6
 
-// UseForwardEnergy selects forward (true) or backward (false) seam energy.
-func UseForwardEnergy(v bool) { forward = v }
+// UseForwardEnergy liga/desliga a energia forward (recomendada) vs backward.
+func UseForwardEnergy(v bool) {
+	forward = v
+}
 
+// SetLevels configura o filtro de níveis (contraste). blackPoint é o valor que
+// vira preto puro, whitePoint o que vira branco puro. Desligue com enabled=false.
 func SetLevels(black, white float32, enabled bool) {
-	blackPoint, whitePoint, levelsEnabled = black, white, enabled
+	blackPoint = black
+	whitePoint = white
+	levelsEnabled = enabled
 }
 
+// SetCenterShield configura o escudo central: strength é o multiplicador máximo
+// de energia aplicado no centro (nas bordas cai para 1x). Desligue com
+// enabled=false.
 func SetCenterShield(strength float64, enabled bool) {
-	if strength < 0 {
-		strength = 0
-	}
-	shieldStrength, shieldEnabled = float32(strength), enabled
+	shieldStrength = strength
+	shieldEnabled = enabled
 }
 
-// Resize resizes src using automatic structure protection. For important
-// subjects such as weapons, faces, lettering, or hands, prefer ResizeWithMask.
+// Resize redimensiona a imagem para width x height usando seam carving, primeiro
+// na largura e depois na altura (ordem width-first). Os planos de cor e o mapa
+// de cinza são mantidos em sincronia durante as operações de costura.
 func Resize(src image.Image, width, height int) image.Image {
 	return ResizeWithMask(src, nil, width, height)
 }
 
-// ResizeWithMask accepts a soft protection mask. Black means no additional
-// protection and white means strongly protected. Mask bounds need not start at
-// (0,0); masks of another size are sampled proportionally.
+// ResizeWithMask é como Resize, mas aceita uma máscara de proteção em tons de
+// cinza (imagem B&W) na qual os pixels claros (branco) recebem energia
+// "infinita" e nunca são cortados pelo seam carving; os escuros (preto) podem
+// ser removidos normalmente. Útil para proteger personagens/objetos do centro.
+// Passe nil para não usar máscara.
 func ResizeWithMask(src, mask image.Image, width, height int) image.Image {
-	if src == nil || width <= 0 || height <= 0 {
+	h, w := src.Bounds().Dy(), src.Bounds().Dx()
+	if h <= 0 || w <= 0 {
 		return src
 	}
-	p := newPlanes(src, mask)
-	if p.w == 0 || p.h == 0 {
-		return src
+	gray, r, g, b, m := toPlanes(src, mask, h, w)
+
+	if width != w {
+		gray, r, g, b, m, w = resizeWidth(gray, r, g, b, m, h, w, width)
 	}
-	p.resizeWidth(width)
-	p.transpose()
-	p.resizeWidth(height)
-	p.transpose()
+	if height != h {
+		// Transpõe, redimensiona a largura (agora a altura original) e transpõe de volta.
+		gray, r, g, b, m = transpose(gray, r, g, b, m, h, w)
+		h, w = w, h
+		gray, r, g, b, m, w = resizeWidth(gray, r, g, b, m, h, w, height)
+		gray, r, g, b, m = transpose(gray, r, g, b, m, h, w)
+		h, w = w, h
+	}
+
+	// Aplica a correção de contraste (levels) ANTES de remontar a imagem, para
+	// devolver pretos profundos e brancos puros (o carving + compressão tende a
+	// "lavar" a imagem).
 	if levelsEnabled {
-		applyLevels(p.r, p.g, p.b, blackPoint, whitePoint)
+		applyLevels(r, g, b, blackPoint, whitePoint)
 	}
-	return p.image()
+
+	return fromPlanes(r, g, b, h, w)
 }
 
-type planes struct {
-	gray, protect []float32
-	r, g, b, a    []uint8
-	w, h          int
-}
-
-func newPlanes(img image.Image, mask image.Image) *planes {
-	b := img.Bounds()
-	p := &planes{w: b.Dx(), h: b.Dy()}
-	n := p.w * p.h
-	p.gray = make([]float32, n)
-	p.protect = make([]float32, n)
-	p.r, p.g, p.b, p.a = make([]uint8, n), make([]uint8, n), make([]uint8, n), make([]uint8, n)
-	for y := 0; y < p.h; y++ {
-		for x := 0; x < p.w; x++ {
-			i := y*p.w + x
-			c := color.RGBAModel.Convert(img.At(b.Min.X+x, b.Min.Y+y)).(color.RGBA)
-			p.r[i], p.g[i], p.b[i], p.a[i] = c.R, c.G, c.B, c.A
-			p.gray[i] = luma(c.R, c.G, c.B)
-			if mask != nil {
-				p.protect[i] = sampleMask(mask, x, y, p.w, p.h)
+// resizeWidth ajusta a largura para targetW, reduzindo ou expandindo conforme
+// necessário. A expansão usa passos graduais (step_ratio = 0.5) para melhor
+// qualidade, recomputando a energia a cada passo.
+func resizeWidth(gray []float32, r, g, b []uint8, m []float32, h, w, targetW int) ([]float32, []uint8, []uint8, []uint8, []float32, int) {
+	switch {
+	case targetW < w:
+		delta := w - targetW
+		mask := getSeams(gray, m, h, w, delta, forward)
+		gray, r, g, b, m, w = removeSeams(gray, r, g, b, m, h, w, mask)
+	case targetW > w:
+		delta := targetW - w
+		for delta > 0 {
+			step := int(math.Round(0.5 * float64(w)))
+			if step < 1 {
+				step = 1
 			}
-		}
-	}
-	return p
-}
-
-func sampleMask(mask image.Image, x, y, dstW, dstH int) float32 {
-	mb := mask.Bounds()
-	mw, mh := mb.Dx(), mb.Dy()
-	if mw <= 0 || mh <= 0 {
-		return 0
-	}
-	mx := mb.Min.X + x*mw/dstW
-	my := mb.Min.Y + y*mh/dstH
-	if mx >= mb.Max.X {
-		mx = mb.Max.X - 1
-	}
-	if my >= mb.Max.Y {
-		my = mb.Max.Y - 1
-	}
-	v := color.GrayModel.Convert(mask.At(mx, my)).(color.Gray).Y
-	return float32(v) / 255
-}
-
-func (p *planes) resizeWidth(target int) {
-	if target <= 0 || target == p.w {
-		return
-	}
-	if target < p.w {
-		if p.w <= 1 {
-			return
-		}
-		for p.w > target {
-			seam := p.findSeam()
-			p.remove(seam)
-			if p.w <= 1 {
-				break
+			if step > delta {
+				step = delta
 			}
+			mask := getSeams(gray, m, h, w, step, forward)
+			gray, r, g, b, m, w = insertSeams(gray, r, g, b, m, h, w, mask, step)
+			gray = rgbToGray(r, g, b, h, w)
+			delta -= step
 		}
-		return
 	}
-	for p.w < target {
-		seam := p.findSeam()
-		p.insert(seam)
-	}
+	return gray, r, g, b, m, w
 }
 
-// findSeam recalculates all structure costs. This deliberate one-seam policy
-// prevents a batch of seams from collectively cutting through a thin object.
-// If the lowest-cost seam crosses a strongly protected region, a second pass
-// that hard-forbids protected pixels is attempted so the cut routes around the
-// protected subject whenever an unobstructed path exists.
-func (p *planes) findSeam() []int32 {
-	energy := p.energy()
-	var seam []int32
-	if forward {
-		seam = forwardSeam(p.gray, energy, p.w, p.h)
-	} else {
-		seam = backwardSeam(energy, p.w, p.h)
-	}
-	if p.crossesProtection(seam) {
-		if alt := p.avoidProtectionSeam(); len(alt) > 0 && !p.crossesProtection(alt) {
-			seam = alt
+// getSeams encontra num costuras (uma por linha) e devolve uma máscara h*w onde
+// cada pixel marcado pertence a uma costura (na posição original). Usa um mapa
+// de índices para registrar onde cada costura cairia na imagem original.
+func getSeams(gray, m []float32, h, w, num int, useForward bool) []bool {
+	mask := make([]bool, h*w)
+	idxMap := make([]int32, h*w)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			idxMap[y*w+x] = int32(x)
 		}
 	}
-	return seam
+
+	cur := gray
+	cm := m
+	cw := w
+	var energy []float32
+	if !useForward {
+		energy = getEnergy(cur, cm, h, cw)
+	}
+
+	for k := 0; k < num; k++ {
+		var seam []int32
+		if useForward {
+			seam = getForwardSeam(cur, cm, h, cw)
+		} else {
+			seam = getBackwardSeam(energy, h, cw)
+		}
+
+		for y := 0; y < h; y++ {
+			c := int(seam[y])
+			mask[y*w+int(idxMap[y*cw+c])] = true
+		}
+
+		// Remove a costura do gray, da máscara e do mapa de índices (mantém as
+		// três alinhadas conforme as colunas são removidas).
+		ncw := cw - 1
+		ncur := make([]float32, h*ncw)
+		nm := make([]float32, h*ncw)
+		nidx := make([]int32, h*ncw)
+		for y := 0; y < h; y++ {
+			c := int(seam[y])
+			sy := y * cw
+			ny := y * ncw
+			copy(ncur[ny:ny+c], cur[sy:sy+c])
+			copy(ncur[ny+c:ny+ncw], cur[sy+c+1:sy+cw])
+			copy(nm[ny:ny+c], cm[sy:sy+c])
+			copy(nm[ny+c:ny+ncw], cm[sy+c+1:sy+cw])
+			copy(nidx[ny:ny+c], idxMap[sy:sy+c])
+			copy(nidx[ny+c:ny+ncw], idxMap[sy+c+1:sy+cw])
+		}
+		cur = ncur
+		cm = nm
+		idxMap = nidx
+		cw = ncw
+
+		if !useForward {
+			energy = getEnergy(cur, cm, h, cw)
+		}
+	}
+	return mask
 }
 
-// crossesProtection reports whether the seam passes over any strongly protected
-// pixel.
-func (p *planes) crossesProtection(seam []int32) bool {
-	for y, sx := range seam {
-		if p.protect[y*p.w+int(sx)] >= protectCrossThr {
-			return true
-		}
-	}
-	return false
-}
-
-// avoidProtectionSeam computes a seam treating protected pixels as hard-forbidden
-// (cost = maxCost). It returns nil if no seam avoids them (i.e. every path must
-// cross the protected region).
-func (p *planes) avoidProtectionSeam() []int32 {
-	energy := p.energy()
-	for i := range energy {
-		if p.protect[i] >= protectCrossThr {
-			energy[i] = maxCost
-		}
-	}
-	var seam []int32
-	if forward {
-		seam = forwardSeam(p.gray, energy, p.w, p.h)
-	} else {
-		seam = backwardSeam(energy, p.w, p.h)
-	}
-	if p.crossesProtection(seam) {
-		return nil
-	}
-	return seam
-}
-
-// energy returns an additive, finite cost map. Scharr magnitude captures line
-// art; local 3x3 dilation protects the white interior immediately adjacent to a
-// contour; the user mask and center prior are independent additive terms.
-func (p *planes) energy() []float32 {
-	n := p.w * p.h
-	gx := make([]float32, n)
-	gy := make([]float32, n)
-	parallelRows(p.h, func(y0, y1 int) {
-		for y := y0; y < y1; y++ {
-			for x := 0; x < p.w; x++ {
-				i := y*p.w + x
-				gx[i], gy[i] = scharrAt(p.gray, p.w, p.h, x, y)
-			}
-		}
-	})
-	out := make([]float32, n)
-	parallelRows(p.h, func(y0, y1 int) {
-		for y := y0; y < y1; y++ {
-			for x := 0; x < p.w; x++ {
-				i := y*p.w + x
-				// Local 3x3 dilation: protects the region immediately around a
-				// contour (e.g. white interiors bordered by black line art).
-				local := float32(0)
-				for dy := -1; dy <= 1; dy++ {
-					yy := reflectIndex(y+dy, p.h)
-					for dx := -1; dx <= 1; dx++ {
-						mag := abs32(gx[yy*p.w+reflectIndex(x+dx, p.w)]) + abs32(gy[yy*p.w+reflectIndex(x+dx, p.w)])
-						if mag > local {
-							local = mag
-						}
-					}
-				}
-				mag := abs32(gx[i]) + abs32(gy[i])
-				v := mag + edgeWeight*local
-				// Orientation term: penalize cutting across vertical edges (a
-				// seam column that passes through a vertical edge severs it).
-				v += orientWeight * abs32(gx[i])
-				v += p.protect[i] * protectCost
-				v += centerPrior(p.w, p.h, x, y) * centerCost
-				out[i] = clampCost(v)
-			}
-		}
-	})
-	return out
-}
-
-func parallelRows(h int, fn func(y0, y1 int)) {
-	workers := runtime.GOMAXPROCS(0)
-	if workers > maxWorkers {
-		workers = maxWorkers
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	if h < workers*16 {
-		workers = 1
-	}
-	if workers == 1 {
-		fn(0, h)
-		return
-	}
-	step := (h + workers - 1) / workers
-	var wg sync.WaitGroup
-	for y := 0; y < h; y += step {
-		y0, y1 := y, y+step
-		if y1 > h {
-			y1 = h
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			fn(y0, y1)
-		}()
-	}
-	wg.Wait()
-}
-
-func forwardSeam(gray, salience []float32, w, h int) []int32 {
-	parent := make([]int32, w*h)
-	prev, next := make([]float32, w+2), make([]float32, w+2)
-	prev[0], prev[w+1] = maxCost, maxCost
+// removeSeams compacta cada linha removendo os pixels marcados na máscara.
+// Cada linha deve ter exatamente o mesmo número de pixels marcados.
+func removeSeams(gray []float32, r, g, b []uint8, m []float32, h, w int, mask []bool) ([]float32, []uint8, []uint8, []uint8, []float32, int) {
+	removed := 0
 	for x := 0; x < w; x++ {
-		left, right := gray[x], gray[x]
-		if x > 0 {
-			left = gray[x-1]
+		if mask[x] {
+			removed++
 		}
-		if x+1 < w {
-			right = gray[x+1]
-		}
-		prev[x+1] = clampCost(abs32(right-left) + salience[x])
 	}
-	for y := 1; y < h; y++ {
-		next[0], next[w+1] = maxCost, maxCost
+	nw := w - removed
+
+	ng := make([]float32, h*nw)
+	nr := make([]uint8, h*nw)
+	ngg := make([]uint8, h*nw)
+	nb := make([]uint8, h*nw)
+	nm := make([]float32, h*nw)
+	for y := 0; y < h; y++ {
+		sy := y * w
+		ny := y * nw
+		j := 0
 		for x := 0; x < w; x++ {
-			i := y*w + x
-			left, right := gray[i], gray[i]
-			if x > 0 {
-				left = gray[i-1]
+			if mask[sy+x] {
+				continue
 			}
-			if x+1 < w {
-				right = gray[i+1]
-			}
-			up := gray[i-w]
-			mid := abs32(right-left) + salience[i]
-			cl := mid + abs32(up-left)
-			cr := mid + abs32(up-right)
-			best, par := satAdd(prev[x], cl), int32(clampIdx(x-1, w))
-			if v := satAdd(prev[x+1], mid); v < best {
-				best, par = v, int32(x)
-			}
-			if v := satAdd(prev[x+2], cr); v < best {
-				best, par = v, int32(clampIdx(x+1, w))
-			}
-			next[x+1], parent[i] = best, par
-		}
-		prev, next = next, prev
-	}
-	end := 0
-	for x := 1; x < w; x++ {
-		if prev[x+1] < prev[end+1] {
-			end = x
+			ng[ny+j] = gray[sy+x]
+			nr[ny+j] = r[sy+x]
+			ngg[ny+j] = g[sy+x]
+			nb[ny+j] = b[sy+x]
+			nm[ny+j] = m[sy+x]
+			j++
 		}
 	}
-	return trace(parent, w, h, end)
+	return ng, nr, ngg, nb, nm, nw
 }
 
-func backwardSeam(energy []float32, w, h int) []int32 {
-	parent := make([]int32, w*h)
-	prev, next := make([]float32, w+2), make([]float32, w+2)
-	prev[0], prev[w+1] = maxCost, maxCost
-	copy(prev[1:w+1], energy[:w])
-	for y := 1; y < h; y++ {
-		next[0], next[w+1] = maxCost, maxCost
+// insertSeams insere delta pixels em cada linha ao longo das costuras marcadas,
+// interpolando a média entre o pixel à esquerda e o atual.
+func insertSeams(gray []float32, r, g, b []uint8, m []float32, h, w int, mask []bool, delta int) ([]float32, []uint8, []uint8, []uint8, []float32, int) {
+	nw := w + delta
+	nr := make([]uint8, h*nw)
+	ngg := make([]uint8, h*nw)
+	nb := make([]uint8, h*nw)
+	nm := make([]float32, h*nw)
+
+	for y := 0; y < h; y++ {
+		sy := y * w
+		ny := y * nw
+		dst := 0
 		for x := 0; x < w; x++ {
-			best, par := prev[x], int32(clampIdx(x-1, w))
-			if prev[x+1] < best {
-				best, par = prev[x+1], int32(x)
-			}
-			if prev[x+2] < best {
-				best, par = prev[x+2], int32(clampIdx(x+1, w))
-			}
-			next[x+1], parent[y*w+x] = satAdd(best, energy[y*w+x]), par
-		}
-		prev, next = next, prev
-	}
-	end := 0
-	for x := 1; x < w; x++ {
-		if prev[x+1] < prev[end+1] {
-			end = x
-		}
-	}
-	return trace(parent, w, h, end)
-}
-
-func trace(parent []int32, w, h, end int) []int32 {
-	seam := make([]int32, h)
-	seam[h-1] = int32(end)
-	for y := h - 1; y > 0; y-- {
-		seam[y-1] = parent[y*w+int(seam[y])]
-	}
-	return seam
-}
-
-func (p *planes) remove(seam []int32) {
-	if p.w <= 1 {
-		return
-	}
-	nw := p.w - 1
-	q := &planes{w: nw, h: p.h}
-	n := nw * p.h
-	q.gray, q.protect = make([]float32, n), make([]float32, n)
-	q.r, q.g, q.b, q.a = make([]uint8, n), make([]uint8, n), make([]uint8, n), make([]uint8, n)
-	for y, sx32 := range seam {
-		sx, src, dst := int(sx32), y*p.w, y*nw
-		copy(q.gray[dst:dst+sx], p.gray[src:src+sx])
-		copy(q.gray[dst+sx:dst+nw], p.gray[src+sx+1:src+p.w])
-		copy(q.protect[dst:dst+sx], p.protect[src:src+sx])
-		copy(q.protect[dst+sx:dst+nw], p.protect[src+sx+1:src+p.w])
-		copy(q.r[dst:dst+sx], p.r[src:src+sx])
-		copy(q.r[dst+sx:dst+nw], p.r[src+sx+1:src+p.w])
-		copy(q.g[dst:dst+sx], p.g[src:src+sx])
-		copy(q.g[dst+sx:dst+nw], p.g[src+sx+1:src+p.w])
-		copy(q.b[dst:dst+sx], p.b[src:src+sx])
-		copy(q.b[dst+sx:dst+nw], p.b[src+sx+1:src+p.w])
-		copy(q.a[dst:dst+sx], p.a[src:src+sx])
-		copy(q.a[dst+sx:dst+nw], p.a[src+sx+1:src+p.w])
-	}
-	*p = *q
-}
-
-func (p *planes) insert(seam []int32) {
-	nw := p.w + 1
-	q := &planes{w: nw, h: p.h}
-	n := nw * p.h
-	q.gray, q.protect = make([]float32, n), make([]float32, n)
-	q.r, q.g, q.b, q.a = make([]uint8, n), make([]uint8, n), make([]uint8, n), make([]uint8, n)
-	for y, sx32 := range seam {
-		sx, src, dst := int(sx32), y*p.w, y*nw
-		for x := 0; x < p.w; x++ {
-			if x == sx {
-				// Edge-guided interpolation: blend with the neighbor of smaller
-				// gradient to avoid blurring/duplicating strokes.
-				nL, nR := x-1, x+1
-				if nL < 0 {
-					nL = x
+			if mask[sy+x] {
+				left := x - 1
+				if left < 0 {
+					left = 0
 				}
-				if nR >= p.w {
-					nR = x
-				}
-				neighbor := nL
-				if abs32(p.gray[src+nR]-p.gray[src+x]) < abs32(p.gray[src+nL]-p.gray[src+x]) {
-					neighbor = nR
-				}
-				q.r[dst], q.g[dst], q.b[dst], q.a[dst] = avg8(p.r[src+x], p.r[src+neighbor]), avg8(p.g[src+x], p.g[src+neighbor]), avg8(p.b[src+x], p.b[src+neighbor]), avg8(p.a[src+x], p.a[src+neighbor])
-				q.gray[dst] = luma(q.r[dst], q.g[dst], q.b[dst])
-				q.protect[dst] = max32(p.protect[src+x], p.protect[src+neighbor])
+				nr[ny+dst] = uint8((int(r[sy+left]) + int(r[sy+x])) / 2)
+				ngg[ny+dst] = uint8((int(g[sy+left]) + int(g[sy+x])) / 2)
+				nb[ny+dst] = uint8((int(b[sy+left]) + int(b[sy+x])) / 2)
+				nm[ny+dst] = m[sy+x]
 				dst++
 			}
-			q.r[dst], q.g[dst], q.b[dst], q.a[dst] = p.r[src+x], p.g[src+x], p.b[src+x], p.a[src+x]
-			q.gray[dst], q.protect[dst] = p.gray[src+x], p.protect[src+x]
+			nr[ny+dst] = r[sy+x]
+			ngg[ny+dst] = g[sy+x]
+			nb[ny+dst] = b[sy+x]
+			nm[ny+dst] = m[sy+x]
 			dst++
 		}
 	}
-	*p = *q
+
+	// Reconstrói o gray a partir dos planos de cor.
+	ng := rgbToGray(nr, ngg, nb, h, nw)
+	return ng, nr, ngg, nb, nm, nw
 }
 
-func (p *planes) transpose() {
-	q := &planes{w: p.h, h: p.w}
-	n := p.w * p.h
-	q.gray, q.protect = make([]float32, n), make([]float32, n)
-	q.r, q.g, q.b, q.a = make([]uint8, n), make([]uint8, n), make([]uint8, n), make([]uint8, n)
-	for y := 0; y < p.h; y++ {
-		for x := 0; x < p.w; x++ {
-			s, d := y*p.w+x, x*q.w+y
-			q.gray[d], q.protect[d] = p.gray[s], p.protect[s]
-			q.r[d], q.g[d], q.b[d], q.a[d] = p.r[s], p.g[s], p.b[s], p.a[s]
+// getBackwardSeam encontra a costura de energia mínima via programação dinâmica
+// sobre o mapa de energia (abordagem backward).
+func getBackwardSeam(energy []float32, h, w int) []int32 {
+	inf := float32(math.Inf(1))
+	cost := make([]float32, w+2)
+	cost[0] = inf
+	cost[w+1] = inf
+	for j := 0; j < w; j++ {
+		cost[j+1] = energy[j]
+	}
+	parent := make([][]int32, h)
+
+	for r := 1; r < h; r++ {
+		parentRow := make([]int32, w)
+		best := make([]float32, w)
+		for j := 0; j < w; j++ {
+			bv := cost[j]
+			p := int32(j - 1)
+			if cost[j+1] < bv {
+				bv = cost[j+1]
+				p = int32(j)
+			}
+			if cost[j+2] < bv {
+				bv = cost[j+2]
+				p = int32(j + 1)
+			}
+			best[j] = bv
+			parentRow[j] = p
+		}
+		for j := 0; j < w; j++ {
+			cost[j+1] = best[j] + energy[r*w+j]
+		}
+		parent[r] = parentRow
+	}
+
+	c := 0
+	bv := cost[1]
+	for j := 1; j < w; j++ {
+		if cost[j+1] < bv {
+			bv = cost[j+1]
+			c = j
 		}
 	}
-	*p = *q
-}
 
-func (p *planes) image() image.Image {
-	dst := image.NewRGBA(image.Rect(0, 0, p.w, p.h))
-	for i := range p.r {
-		j := i * 4
-		dst.Pix[j], dst.Pix[j+1], dst.Pix[j+2], dst.Pix[j+3] = p.r[i], p.g[i], p.b[i], p.a[i]
+	seam := make([]int32, h)
+	seam[h-1] = int32(c)
+	for r := h - 2; r >= 0; r-- {
+		seam[r] = parent[r+1][seam[r+1]]
 	}
-	return dst
+	return seam
 }
 
-// scharrAt returns the Scharr gradient components (Gx, Gy) at (x, y). Scharr
-// responds more isotropically than Sobel, preserving thin diagonal strokes such
-// as the handle of a sickle.
-func scharrAt(gray []float32, w, h, x, y int) (float32, float32) {
-	x0, x1 := reflectIndex(x-1, w), reflectIndex(x+1, w)
-	y0, y1 := reflectIndex(y-1, h), reflectIndex(y+1, h)
-	tl, tc, tr := gray[y0*w+x0], gray[y0*w+x], gray[y0*w+x1]
-	ml, mr := gray[y*w+x0], gray[y*w+x1]
-	bl, bc, br := gray[y1*w+x0], gray[y1*w+x], gray[y1*w+x1]
-	gx := -3*tl + 3*tr - 10*ml + 10*mr - 3*bl + 3*br
-	gy := -3*tl - 10*tc - 3*tr + 3*bl + 10*bc + 3*br
-	return gx, gy
+// getForwardSeam encontra a costura usando energia forward, que penaliza a
+// energia introduzida ao remover o pixel (melhor qualidade visual). Também
+// respeita o escudo central e a máscara de proteção.
+func getForwardSeam(gray, m []float32, h, w int) []int32 {
+	pw := w + 2
+	pad := make([]float32, h*pw)
+	for r := 0; r < h; r++ {
+		sy := r * w
+		py := r * pw
+		pad[py] = gray[sy]
+		for c := 0; c < w; c++ {
+			pad[py+1+c] = gray[sy+c]
+		}
+		pad[py+pw-1] = gray[sy+w-1]
+	}
+
+	inf := float32(math.Inf(1))
+	dp := make([]float32, pw)
+	for j := 0; j < w; j++ {
+		dp[j+1] = float32(math.Abs(float64(pad[j+2]-pad[j])))*m[j] + maskPenalty(m[j])
+	}
+	dp[0] = inf
+	dp[pw-1] = inf
+
+	parent := make([][]int32, h)
+	for r := 1; r < h; r++ {
+		pr := r * pw
+		pp := (r - 1) * pw
+		parentRow := make([]int32, w)
+		best := make([]float32, w)
+		for j := 0; j < w; j++ {
+			idx := pr + 1 + j
+			currShl := pad[idx+1]
+			currShr := pad[idx-1]
+			prevMid := pad[pp+1+j]
+			costMid := float32(math.Abs(float64(currShl - currShr)))
+			costLeft := costMid + float32(math.Abs(float64(prevMid-currShr)))
+			costRight := costMid + float32(math.Abs(float64(prevMid-currShl)))
+
+			// Escudo central + máscara de proteção: multiplica e soma a penalidade
+			// para que pixels protegidos (mesmo de energia zero) não sejam cortados.
+			cw := centerWeight(w, h, j, r) * m[r*w+j]
+			pen := maskPenalty(m[r*w+j])
+			costMid = costMid*cw + pen
+			costLeft = costLeft*cw + pen
+			costRight = costRight*cw + pen
+
+			vL := costLeft + dp[j]
+			vM := costMid + dp[j+1]
+			vR := costRight + dp[j+2]
+			bv := vL
+			p := int32(j - 1)
+			if vM < bv {
+				bv = vM
+				p = int32(j)
+			}
+			if vR < bv {
+				bv = vR
+				p = int32(j + 1)
+			}
+			best[j] = bv
+			parentRow[j] = p
+		}
+		for j := 0; j < w; j++ {
+			dp[j+1] = best[j]
+		}
+		parent[r] = parentRow
+	}
+
+	c := 0
+	bv := dp[1]
+	for j := 1; j < w; j++ {
+		if dp[j+1] < bv {
+			bv = dp[j+1]
+			c = j
+		}
+	}
+
+	seam := make([]int32, h)
+	seam[h-1] = int32(c)
+	for r := h - 2; r >= 0; r-- {
+		seam[r] = parent[r+1][seam[r+1]]
+	}
+	return seam
 }
 
-func centerPrior(w, h, x, y int) float32 {
+// maskPenalty devolve uma energia adicional (muito grande) para pixels
+// protegidos. Soma-se (não apenas multiplica-se) porque multiplicar um pixel de
+// energia zero por um fator alto continua 0, permitindo que ele fosse cortado.
+func maskPenalty(m float32) float32 {
+	if m > 1 {
+		return maskProtected
+	}
+	return 0
+}
+
+// getEnergy computa o mapa de energia backward (gradiente Sobel, magnitude L1)
+// com uma penalidade pesada de distanciamento para proteger o centro da arte e
+// com o multiplicador de máscara (pixels protegidos têm energia enorme).
+func getEnergy(gray, m []float32, h, w int) []float32 {
+	energy := make([]float32, h*w)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			gx := sobelX(gray, h, w, x, y)
+			gy := sobelY(gray, h, w, x, y)
+			idx := y*w + x
+			baseEnergy := float32(math.Abs(float64(gx)) + math.Abs(float64(gy)))
+			energy[idx] = baseEnergy*centerWeight(w, h, x, y)*m[idx] + maskPenalty(m[idx])
+		}
+	}
+	return energy
+}
+
+// centerWeight devolve um multiplicador de energia que cresce em direção ao
+// centro da imagem (escudo protetor). No centro o peso é ~(1+strength)x maior;
+// nas bordas extremas cai para 1x. Com strength=0 ou shield desligado, devolve
+// sempre 1 (sem proteção).
+func centerWeight(w, h, x, y int) float32 {
 	if !shieldEnabled || shieldStrength <= 0 {
-		return 0
+		return 1
 	}
-	cx, cy := float32(w-1)/2, float32(h-1)/2
-	dx, dy := float32(x)-cx, float32(y)-cy
-	maxD := float32(math.Hypot(float64(cx), float64(cy)))
-	if maxD == 0 {
-		return shieldStrength
+	centerX := float64(w) / 2.0
+	centerY := float64(h) / 2.0
+	maxDist := math.Sqrt(centerX*centerX + centerY*centerY)
+	if maxDist <= 0 {
+		return 1
 	}
-	d := float32(math.Hypot(float64(dx), float64(dy))) / maxD
-	if d > 1 {
-		d = 1
+	dx := float64(x) - centerX
+	dy := float64(y) - centerY
+	dist := math.Sqrt(dx*dx + dy*dy)
+	if dist > maxDist {
+		dist = maxDist
 	}
-	return (1 - d) * shieldStrength
+	return float32(1.0 + (1.0-dist/maxDist)*shieldStrength)
 }
 
-func reflectIndex(i, n int) int {
-	if n <= 1 {
-		return 0
+func sobelX(gray []float32, h, w, x, y int) float32 {
+	var gx float32
+	for dy := -1; dy <= 1; dy++ {
+		yy := refl(y+dy, h)
+		for dx := -1; dx <= 1; dx++ {
+			xx := refl(x+dx, w)
+			var k float32
+			switch {
+			case dx == 1:
+				k = 1
+				if dy == 0 {
+					k = 2
+				}
+			case dx == -1:
+				k = -1
+				if dy == 0 {
+					k = -2
+				}
+			}
+			gx += k * gray[yy*w+xx]
+		}
 	}
-	if i < 0 {
-		return -i
-	}
-	if i >= n {
-		return 2*n - 2 - i
-	}
-	return i
-}
-func luma(r, g, b uint8) float32 {
-	return .2126*float32(r) + .7152*float32(g) + .0722*float32(b)
-}
-func abs32(v float32) float32 {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-func clampIdx(i, w int) int {
-	if i < 0 {
-		return 0
-	}
-	if i >= w {
-		return w - 1
-	}
-	return i
-}
-func max32(a, b float32) float32 {
-	if a > b {
-		return a
-	}
-	return b
-}
-func avg8(a, b uint8) uint8 {
-	return uint8((uint16(a) + uint16(b)) / 2)
-}
-func clampCost(v float32) float32 {
-	if v > maxCost {
-		return maxCost
-	}
-	return v
-}
-func satAdd(a, b float32) float32 {
-	if a >= maxCost-b {
-		return maxCost
-	}
-	return a + b
+	return gx
 }
 
-func applyLevels(r, g, b []uint8, black, white float32) {
-	if white <= black {
+func sobelY(gray []float32, h, w, x, y int) float32 {
+	var gy float32
+	for dy := -1; dy <= 1; dy++ {
+		yy := refl(y+dy, h)
+		for dx := -1; dx <= 1; dx++ {
+			xx := refl(x+dx, w)
+			var k float32
+			switch {
+			case dy == 1:
+				k = 1
+				if dx == 0 {
+					k = 2
+				}
+			case dy == -1:
+				k = -1
+				if dx == 0 {
+					k = -2
+				}
+			}
+			gy += k * gray[yy*w+xx]
+		}
+	}
+	return gy
+}
+
+// refl aplica indexação espelhada (reflect) para bordas, como no scipy.
+func refl(idx, n int) int {
+	if idx < 0 {
+		idx = -idx
+	}
+	if idx >= n {
+		idx = 2*n - 2 - idx
+	}
+	return idx
+}
+
+// toPlanes converte uma image.Image em planos de cinza (float32), RGB (uint8) e
+// máscara de proteção (float32, multiplicador de energia), com dimensões h x w.
+// A máscara (imagem B&W opcional): pixels claros (branco) recebem maskProtected
+// (não podem ser cortados); escuros recebem 1 (sem proteção). nil = sem máscara.
+func toPlanes(img, mask image.Image, h, w int) ([]float32, []uint8, []uint8, []uint8, []float32) {
+	gray := make([]float32, h*w)
+	r := make([]uint8, h*w)
+	g := make([]uint8, h*w)
+	b := make([]uint8, h*w)
+	m := make([]float32, h*w)
+	for i := range m {
+		m[i] = 1
+	}
+
+	if mask != nil {
+		mb := mask.Bounds()
+		moff := mb.Min
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				sy := y
+				if sy < mb.Min.Y {
+					sy = mb.Min.Y
+				} else if sy >= mb.Max.Y {
+					sy = mb.Max.Y - 1
+				}
+				sx := x
+				if sx < mb.Min.X {
+					sx = mb.Min.X
+				} else if sx >= mb.Max.X {
+					sx = mb.Max.X - 1
+				}
+				c := color.GrayModel.Convert(mask.At(moff.X+sx, moff.Y+sy)).(color.Gray)
+				if c.Y > 127 {
+					m[y*w+x] = maskProtected
+				}
+			}
+		}
+	}
+
+	off := img.Bounds().Min
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := color.RGBAModel.Convert(img.At(off.X+x, off.Y+y)).(color.RGBA)
+			idx := y*w + x
+			r[idx] = c.R
+			g[idx] = c.G
+			b[idx] = c.B
+			gray[idx] = 0.2126*float32(c.R) + 0.7152*float32(c.G) + 0.0722*float32(c.B)
+		}
+	}
+	return gray, r, g, b, m
+}
+
+// rgbToGray reconstrói o mapa de cinza a partir dos planos RGB.
+func rgbToGray(r, g, b []uint8, h, w int) []float32 {
+	gray := make([]float32, h*w)
+	for i := 0; i < h*w; i++ {
+		gray[i] = 0.2126*float32(r[i]) + 0.7152*float32(g[i]) + 0.0722*float32(b[i])
+	}
+	return gray
+}
+
+// transpose transpoe os planos (troca linhas por colunas), mantendo a máscara.
+func transpose(gray []float32, r, g, b []uint8, m []float32, h, w int) ([]float32, []uint8, []uint8, []uint8, []float32) {
+	ng := make([]float32, h*w)
+	nm := make([]float32, h*w)
+	nr := make([]uint8, h*w)
+	ngg := make([]uint8, h*w)
+	nb := make([]uint8, h*w)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			src := y*w + x
+			dst := x*h + y
+			ng[dst] = gray[src]
+			nm[dst] = m[src]
+			nr[dst] = r[src]
+			ngg[dst] = g[src]
+			nb[dst] = b[src]
+		}
+	}
+	return ng, nr, ngg, nb, nm
+}
+
+// applyLevels estica o histograma da imagem (simulando a ferramenta Levels do
+// Photoshop) em cada canal RGB. Valores <= blackPoint viram 0 (preto puro);
+// valores >= whitePoint viram 255 (branco puro); o restante é interpolado para
+// cobrir toda a escala 0-255.
+func applyLevels(r, g, b []uint8, blackPoint, whitePoint float32) {
+	if whitePoint <= blackPoint {
 		return
 	}
-	rng := white - black
-	for i := range r {
-		r[i] = level(r[i], black, rng)
-		g[i] = level(g[i], black, rng)
-		b[i] = level(b[i], black, rng)
+	rangeV := whitePoint - blackPoint
+	for i := 0; i < len(r); i++ {
+		r[i] = clampLevel(float32(r[i]), blackPoint, rangeV)
+		g[i] = clampLevel(float32(g[i]), blackPoint, rangeV)
+		b[i] = clampLevel(float32(b[i]), blackPoint, rangeV)
 	}
 }
-func level(v uint8, min, rng float32) uint8 {
-	f := float32(v)
-	if f <= min {
+
+// clampLevel mapeia um valor do intervalo [min, max] para 0-255.
+func clampLevel(v, min, rangeV float32) uint8 {
+	if v <= min {
 		return 0
 	}
-	if f >= min+rng {
+	if v >= min+rangeV {
 		return 255
 	}
-	return uint8((f - min) * 255 / rng)
+	return uint8(((v - min) / rangeV) * 255.0)
+}
+
+// fromPlanes monta uma image.RGBA a partir dos planos RGB.
+func fromPlanes(r, g, b []uint8, h, w int) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for i := 0; i < h*w; i++ {
+		dst.Pix[i*4] = r[i]
+		dst.Pix[i*4+1] = g[i]
+		dst.Pix[i*4+2] = b[i]
+		dst.Pix[i*4+3] = 255
+	}
+	return dst
 }
