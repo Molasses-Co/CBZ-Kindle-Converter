@@ -7,7 +7,7 @@
 // indicam linha/traço estrutural e valores ALTOS indicam fundo. Ele separa o
 // traço estrutural da trama/screentone.
 //
-// As linhas extraídas alimentam a máscara de proteção do seam carving, de modo
+// As linhas extraídas alimentam a máscara de proteção do retargeting, de modo
 // que objetos/estruturas detectados pela rede (e não por um limiar de gradiente
 // cru) sejam preservados pelo redimensionamento.
 //

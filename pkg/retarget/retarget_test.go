@@ -3,6 +3,7 @@ package retarget
 import (
 	"image"
 	"image/color"
+	"math"
 	"testing"
 )
 
@@ -51,26 +52,28 @@ func blockBounds(img image.Image) (x0, y0, x1, y1 int) {
 	return
 }
 
-// TestGridWarpPreservaAspecto garante que, ao mudar o aspect ratio, o bloco
-// protegido mantém o mesmo tamanho (aspecto preservado, sem shear) enquanto o
-// fundo absorve a mudança.
-func TestGridWarpPreservaAspecto(t *testing.T) {
-	// Origem 600x900; destino 800x700 (aspecto muda: ~0.67 -> ~1.14).
-	// Bloco protegido de 120x240 no centro.
+// TestCoverCropPreservaAspecto garante que, ao mudar o aspect ratio, o bloco
+// saliente mantém o aspecto (escala uniforme, sem shear/stretch) e permanece
+// dentro da janela de crop (não é cortado).
+func TestCoverCropPreservaAspecto(t *testing.T) {
+	// Origem 600x900; destino 800x700 (aspecto muda). Bloco 120x240 centrado.
 	img, mask := buildProbe(600, 900, 240, 330, 120, 240)
 	out := Fit(img, mask, 800, 700)
 
-	x0, y0, x1, y1 := blockBounds(out)
-	gotW, gotH := x1-x0+1, y1-y0+1
-	t.Logf("bloco resultante: %dx%d em (%d,%d)-(%d,%d)", gotW, gotH, x0, y0, x1, y1)
-	if gotW < 110 || gotW > 130 {
-		t.Errorf("esperava largura do bloco ~120 (preservada), got=%d", gotW)
-	}
-	if gotH < 225 || gotH > 255 {
-		t.Errorf("esperava altura do bloco ~240 (preservada), got=%d", gotH)
-	}
 	if out.Bounds().Dx() != 800 || out.Bounds().Dy() != 700 {
-		t.Errorf("dimensão do resultado errada: %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
+		t.Fatalf("dimensão do resultado errada: %dx%d", out.Bounds().Dx(), out.Bounds().Dy())
+	}
+
+	x0, y0, x1, y1 := blockBounds(out)
+	if x0 < 0 || y0 < 0 || x1 >= 800 || y1 >= 700 {
+		t.Fatalf("bloco cortado pelo crop: (%d,%d)-(%d,%d)", x0, y0, x1, y1)
+	}
+	gotW, gotH := float64(x1-x0+1), float64(y1-y0+1)
+	gotAspect := gotW / gotH
+	wantAspect := 120.0 / 240.0
+	t.Logf("bloco resultante: %.0fx%.0f (aspecto %.3f, esperado %.3f)", gotW, gotH, gotAspect, wantAspect)
+	if math.Abs(gotAspect-wantAspect) > 0.05 {
+		t.Errorf("aspecto do bloco não preservado: got=%.3f want=%.3f", gotAspect, wantAspect)
 	}
 }
 

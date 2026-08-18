@@ -17,13 +17,12 @@ import (
 
 	"cbz-converter/pkg/esrgan"
 	"cbz-converter/pkg/mangaline"
-	"cbz-converter/pkg/seamcarve"
+	"cbz-converter/pkg/retarget"
 	"cbz-converter/pkg/yolo"
 	"github.com/wailsapp/wails/v3/pkg/application"
 
 	// Decoders extras para formatos de imagem suportados (webp, bmp, tiff, gif)
 	_ "golang.org/x/image/bmp"
-	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 )
@@ -178,7 +177,7 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 	s.emitProgress(CBZProgress{Stage: "Preparando", Message: "Inferência em " + mode})
 
 	// Detector YOLO (opcional): identifica personagens/objetos para gerar uma
-	// máscara de proteção ao seam carving. Se falhar, segue sem máscara.
+	// máscara de proteção ao retargeting. Se falhar, segue sem máscara.
 	var det *yolo.Detector
 	if d, err := yolo.New(); err == nil {
 		det = d
@@ -273,7 +272,7 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 			srcW, srcH := img.Bounds().Dx(), img.Bounds().Dy()
 
 			// Máscara de proteção (opcional): detecta personagens/objetos e marca
-			// as regiões para o seam carving não cortar. Combina o YOLO (objetos
+			// as regiões que o retargeting deve preservar. Combina o YOLO (objetos
 			// grandes) com a extração de linhas estruturais (traços finos).
 			var mask image.Image
 			if det != nil {
@@ -287,21 +286,9 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 				}
 			}
 
-			// Escala a máscara para a resolução da imagem que será esculpida
-			// (fitToTarget), mantendo as regiões protegidas alinhadas ao conteúdo.
-			carve := func(src image.Image) (image.Image, image.Image) {
-				fit := fitToTarget(src, width, height)
-				fw, fh := fit.Bounds().Dx(), fit.Bounds().Dy()
-				fitMask := mask
-				if mask != nil && (fw != srcW || fh != srcH) {
-					fitMask = resizeImage(mask, fw, fh)
-				}
-				return fit, fitMask
-			}
-
 			if width > srcW || height > srcH {
 				// Resolução alvo maior que a do arquivo: Real-ESRGAN (4x) para
-				// upscaling e depois seam carving para atingir a resolução final.
+				// upscaling e depois retargeting para atingir a resolução final.
 				action = "melhorando qualidade"
 				w := <-free
 				upscaled, err := esr.UpscaleOne(img, w)
@@ -314,20 +301,10 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 					mu.Unlock()
 					return
 				}
-				fit, fitMask := carve(upscaled)
-				if fitMask != nil {
-					resized = seamcarve.ResizeWithMask(fit, fitMask, width, height)
-				} else {
-					resized = seamcarve.Resize(fit, width, height)
-				}
+				resized = retarget.Fit(upscaled, mask, width, height)
 			} else {
-				// Resolução alvo menor ou igual à do arquivo: apenas seam carving.
-				fit, fitMask := carve(img)
-				if fitMask != nil {
-					resized = seamcarve.ResizeWithMask(fit, fitMask, width, height)
-				} else {
-					resized = seamcarve.Resize(fit, width, height)
-				}
+				// Resolução alvo menor ou igual à do arquivo: retargeting direto.
+				resized = retarget.Fit(img, mask, width, height)
 			}
 
 			results[i] = resized
@@ -436,19 +413,6 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dm %ds", s/60, s%60)
 }
 
-// resizeImage redimensiona a imagem para as dimensões exatas informadas usando
-// interpolação bilinear aproximada (boa relação qualidade/performance).
-func resizeImage(img image.Image, width, height int) image.Image {
-	srcBounds := img.Bounds()
-	if srcBounds.Dx() == width && srcBounds.Dy() == height {
-		return img
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, srcBounds, draw.Over, nil)
-	return dst
-}
-
 // orMask combina duas máscaras de proteção B&W (gray) em uma única: um pixel é
 // protegido (branco) se estiver protegido em qualquer uma das entradas. Obtém o
 // maior retângulo que contém a união (as máscaras costumam ter o mesmo tamanho
@@ -485,38 +449,6 @@ func orMask(a, b image.Image) image.Image {
 		}
 	}
 	return out
-}
-
-// fitToTarget aproxima a imagem (ex.: o resultado 4x do Real-ESRGAN) de um
-// tamanho pouco acima da resolução alvo antes do seam carving. Fazer o seam
-// carving direto do 4x até o alvo removeria milhares de costuras (lentidão
-// extrema e distorção); reduzir primeiro para ~1.2x do alvo deixa o seam
-// carving ajustar apenas o residual, preservando o conteúdo final.
-func fitToTarget(img image.Image, width, height int) image.Image {
-	iw, ih := img.Bounds().Dx(), img.Bounds().Dy()
-
-	workW := iw
-	if workW < width {
-		workW = width
-	}
-	workH := ih
-	if workH < height {
-		workH = height
-	}
-
-	// Cap para ~1.2x do alvo quando o 4x for bem maior.
-	capW := int(float64(width) * 1.2)
-	capH := int(float64(height) * 1.2)
-	if workW > capW {
-		workW = capW
-	}
-	if workH > capH {
-		workH = capH
-	}
-	if workW == iw && workH == ih {
-		return img
-	}
-	return resizeImage(img, workW, workH)
 }
 
 // Auxiliar para identificar formatos de imagens suportados

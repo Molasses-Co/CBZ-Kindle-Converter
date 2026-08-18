@@ -1,6 +1,6 @@
 // Package yolo encapsula a detecção de objetos com o modelo yolo26n
 // (Ultralytics YOLOv8n, ONNX) via onnxruntime. Detecta personagens/objetos de
-// uma página para gerar uma máscara de proteção usada pelo seam carving (evita
+// uma página para gerar uma máscara de proteção usada pelo retargeting (evita
 // cortar o conteúdo).
 //
 // Assume que o ambiente onnxruntime já foi inicializado (ex.: por esrgan.InitRuntime
