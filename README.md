@@ -83,10 +83,14 @@ wails3 build
   (quantizado w8a8, uint8; `.onnx` + pesos externos `.data`; ambos são gravados
   em disco no mesmo diretório antes de onnxruntime carregar).
 - `pkg/yolo/` — detecção de objetos (YOLOv8n ONNX embutido no pacote) para gerar
-  uma máscara de proteção ao seam carving (protege personagens/objetos do corte).
+  uma máscara de proteção que guia o retargeting (preserva personagens/objetos).
+- `pkg/retarget/` — ajuste à resolução alvo (escala uniforme + crop com janela
+  centrada na saliência, inclinada pela máscara de proteção).
+- `pkg/ortdll/` — embute `onnxruntime.dll` (DirectML) no executável e extrai em
+  runtime, tornando o app autocontido (sem DLLs ao lado).
 - `frontend/` — UI em React/TS; `App.tsx` orquestra o fluxo e chama o backend
   via `frontend/bindings/...` (auto-gerado).
-- `scripts/setup-onnxruntime.ps1` — garante a `onnxruntime.dll` em `bin/`.
+- `scripts/setup-onnxruntime.ps1` — reproduz as DLLs do onnxruntime em `pkg/ortdll/`.
 
 ## Como funciona a inferência (ONNX + Real-ESRGAN)
 

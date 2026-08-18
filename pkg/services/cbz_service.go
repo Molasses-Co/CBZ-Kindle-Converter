@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"fmt"
 	"image"
-	"image/color"
 	"image/jpeg"
 	"io"
 	"os"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	"cbz-converter/pkg/esrgan"
-	"cbz-converter/pkg/mangaline"
 	"cbz-converter/pkg/retarget"
 	"cbz-converter/pkg/yolo"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -187,19 +185,6 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 		s.emitProgress(CBZProgress{Stage: "Preparando", Message: "Detector YOLO indisponível — sem máscara de proteção"})
 	}
 
-	// Extrator de linhas estruturais (opcional): usa MangaLineExtraction para
-	// reforçar a máscara de proteção com os traços detectados pela rede. É um
-	// sinal complementar ao YOLO (estruturas finas que o bounding box do YOLO
-	// não captura, ex.: cabo de foice). Se falhar, segue só com YOLO.
-	var lines *mangaline.Extractor
-	if ld, err := mangaline.FindModelDir(); err == nil {
-		if lx, lerr := mangaline.New(ld); lerr == nil {
-			lines = lx
-			defer lx.Close()
-			s.emitProgress(CBZProgress{Stage: "Preparando", Message: "Extrator de linhas (MangaLineExtraction) carregado"})
-		}
-	}
-
 	// Reutiliza a extração para obter as páginas na pasta temporária
 	extracted, err := s.UnpackCBZ(fileName, fileData)
 	if err != nil {
@@ -272,17 +257,11 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 			srcW, srcH := img.Bounds().Dx(), img.Bounds().Dy()
 
 			// Máscara de proteção (opcional): detecta personagens/objetos e marca
-			// as regiões que o retargeting deve preservar. Combina o YOLO (objetos
-			// grandes) com a extração de linhas estruturais (traços finos).
+			// as regiões que o retargeting deve preservar.
 			var mask image.Image
 			if det != nil {
 				if boxes, err := det.Detect(img); err == nil {
 					mask = det.BuildMask(srcW, srcH, 6, boxes)
-				}
-			}
-			if lines != nil {
-				if lm, err := lines.ProtectionMask(img, 200); err == nil {
-					mask = orMask(mask, lm)
 				}
 			}
 
@@ -411,44 +390,6 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%ds", s)
 	}
 	return fmt.Sprintf("%dm %ds", s/60, s%60)
-}
-
-// orMask combina duas máscaras de proteção B&W (gray) em uma única: um pixel é
-// protegido (branco) se estiver protegido em qualquer uma das entradas. Obtém o
-// maior retângulo que contém a união (as máscaras costumam ter o mesmo tamanho
-// da página). Se apenas uma for nula, devolve a outra.
-func orMask(a, b image.Image) image.Image {
-	if a == nil {
-		return b
-	}
-	if b == nil {
-		return a
-	}
-	ab, bb := a.Bounds(), b.Bounds()
-	w, h := ab.Dx(), ab.Dy()
-	if bb.Dx() > w {
-		w = bb.Dx()
-	}
-	if bb.Dy() > h {
-		h = bb.Dy()
-	}
-	out := image.NewGray(image.Rect(0, 0, w, h))
-	gray := color.GrayModel
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			var va, vb uint8
-			if x < ab.Dx() && y < ab.Dy() {
-				va = gray.Convert(a.At(ab.Min.X+x, ab.Min.Y+y)).(color.Gray).Y
-			}
-			if x < bb.Dx() && y < bb.Dy() {
-				vb = gray.Convert(b.At(bb.Min.X+x, bb.Min.Y+y)).(color.Gray).Y
-			}
-			if va > 0 || vb > 0 {
-				out.SetGray(x, y, color.Gray{Y: 255})
-			}
-		}
-	}
-	return out
 }
 
 // Auxiliar para identificar formatos de imagens suportados
