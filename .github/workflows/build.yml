@@ -1,0 +1,55 @@
+name: Wails build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Este projeto REQUER cgo (pkg/esrgan importa onnxruntime_go, só-cgo). O binário
+# também depende, em runtime, das DLLs/shared libs do onnxruntime (não embutidas),
+# mas a COMPILAÇÃO precisa apenas de um toolchain C (gcc/clang) com CGO_ENABLED=1.
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - { name: cbz-converter, platform: linux/amd64, os: ubuntu-latest }
+          - { name: cbz-converter, platform: windows/amd64, os: windows-latest }
+          - { name: cbz-converter, platform: darwin/universal, os: macos-latest }
+    runs-on: ${{ matrix.build.os }}
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true # modelos ONNX (erika.onnx/.data) são rastreados via Git LFS
+
+      # Windows não tem gcc por padrão e o cgo exige MinGW. Instala o MSYS2/mingw64
+      # e o coloca no PATH para os passos seguintes (a ação usa `go build`/`wails3`).
+      - name: Setup MinGW (Windows, cgo)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          update: true
+
+      # Conflito conhecido cgo+Wails no Windows: o driver gcc auto-linka um
+      # `default-manifest.o` que colide com o manifest embutido do Wails
+      # ("multiple non-default manifests"). Esvazia-o para o link passar.
+      - name: Fix Wails manifest conflict (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          MF="$(cygpath -u "$MINGW_PREFIX")/x86_64-w64-mingw32/lib/default-manifest.o"
+          cp "$MF" "$MF.bak" || true
+          : > "$MF"
+
+      - uses: ToQuery/wails3-build-action@v3
+        with:
+          build-name: ${{ matrix.build.name }}
+          build-platform: ${{ matrix.build.platform }}
