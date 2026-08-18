@@ -1,0 +1,2 @@
+pkg/mangaline/erika.onnx filter=lfs diff=lfs merge=lfs -text
+pkg/mangaline/erika.onnx.data filter=lfs diff=lfs merge=lfs -text
