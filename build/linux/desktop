@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=My Product
+Comment=A cbz-converter application
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/cbz-converter.exe %u
+Terminal=false
+Type=Application
+Icon=cbz-converter.exe
+Categories=Utility;
+StartupWMClass=cbz-converter.exe
+
+ 
