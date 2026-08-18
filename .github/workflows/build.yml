@@ -49,7 +49,7 @@ jobs:
           cp "$MF" "$MF.bak" || true
           : > "$MF"
 
-      - uses: ToQuery/wails3-build-action@v3
+      - uses: ToQuery/wails3-build-action@wails-v3
         with:
           build-name: ${{ matrix.build.name }}
           build-platform: ${{ matrix.build.platform }}
