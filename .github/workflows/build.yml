@@ -8,8 +8,9 @@ on:
   workflow_dispatch:
 
 # Este projeto REQUER cgo (pkg/esrgan importa onnxruntime_go, só-cgo). O binário
-# também depende, em runtime, das DLLs/shared libs do onnxruntime (não embutidas),
-# mas a COMPILAÇÃO precisa apenas de um toolchain C (gcc/clang) com CGO_ENABLED=1.
+# é autocontido (as DLLs/shared libs do onnxruntime são embutidas via go:embed
+# em pkg/ortdll e extraídas em runtime), mas a COMPILAÇÃO precisa apenas de um
+# toolchain C (gcc/clang) com CGO_ENABLED=1.
 jobs:
   build:
     strategy:
@@ -26,7 +27,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          lfs: true # modelos ONNX (erika.onnx/.data) são rastreados via Git LFS
+          lfs: true # sem arquivos LFS no momento; mantido por segurança
+
+      # Wails v3 no Linux requer GTK4 + WebKitGTK 6.0 em runtime e para compilar
+      # (pkg-config: gtk4 / webkitgtk-6.0). build-essential p/ o cgo e
+      # pkg-config p/ a detecção de libs. Instala antes do build.
+      - name: Install Linux deps (GTK4 + WebKitGTK)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
 
       # Windows não tem gcc por padrão e o cgo exige MinGW. Instala o MSYS2/mingw64
       # e o coloca no PATH para os passos seguintes (a ação usa `go build`/`wails3`).
@@ -48,6 +58,13 @@ jobs:
           MF="$(cygpath -u "$MINGW_PREFIX")/x86_64-w64-mingw32/lib/default-manifest.o"
           cp "$MF" "$MF.bak" || true
           : > "$MF"
+
+      # O `wails3 build` gera também o instalador NSIS; sem o makensis o passo
+      # "package" falha. Instala via Chocolatey (shim entra no PATH automaticamente).
+      - name: Install NSIS (Windows installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install nsis --yes --no-progress
 
       - uses: ToQuery/wails3-build-action@wails-v3
         with:
