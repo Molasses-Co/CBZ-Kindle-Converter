@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Dialogs, Events } from "@wailsio/runtime";
 import { CBZService, type CBZProgress } from "../bindings/cbz-converter/pkg/services";
-import { FileImage, Loader2, Settings2, Upload } from "lucide-react";
+import {
+  CheckCircle2, FolderOpen, FolderOutput, Images, Loader2, Play, Settings2, XCircle,
+} from "lucide-react";
 
 const DEFAULT_WIDTH = 1080;
 const DEFAULT_HEIGHT = 1920;
 
-// Presets de resolução de dispositivos Kindle (Largura × Altura). Selecionar um
-// preset preenche automaticamente os campos de largura/altura.
 const KINDLE_PRESETS: { id: string; label: string; width: number; height: number }[] = [
   { id: 'KINDLE_600x800', label: 'Kindle Básico (600×800)', width: 600, height: 800 },
   { id: 'KINDLE_758x1024', label: 'Paperwhite 1 e 2 (758×1024)', width: 758, height: 1024 },
@@ -18,18 +18,23 @@ const KINDLE_PRESETS: { id: string; label: string; width: number; height: number
   { id: 'KINDLE_824x1200', label: 'Kindle DX (824×1200)', width: 824, height: 1200 },
 ];
 
+type FileStatus = 'pending' | 'processing' | 'done' | 'error';
+interface QueueItem { name: string; data: string; status: FileStatus; }
+
+const joinPath = (dir: string, name: string) => dir.replace(/[\\/]+$/, '') + '/' + name;
+
 function App() {
   const [width, setWidth] = useState<number>(DEFAULT_WIDTH);
   const [height, setHeight] = useState<number>(DEFAULT_HEIGHT);
   const [presetId, setPresetId] = useState<string>('custom');
-  const [fileName, setFileName] = useState<string>('');
-  const [fileData, setFileData] = useState<string | null>(null);
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [outDir, setOutDir] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [current, setCurrent] = useState<number>(-1);
   const [progress, setProgress] = useState<number>(0);
   const [progressStage, setProgressStage] = useState<string>('');
   const [progressMessage, setProgressMessage] = useState<string>('');
 
-  // Assina o evento de progresso emitido pelo backend durante o processamento.
   useEffect(() => {
     return Events.On("cbz:progress", (ev) => {
       const d = ev.data as CBZProgress;
@@ -59,199 +64,166 @@ function App() {
     setPresetId(id);
     if (id === 'custom') return;
     const preset = KINDLE_PRESETS.find((p) => p.id === id);
-    if (preset) {
-      setWidth(preset.width);
-      setHeight(preset.height);
-    }
+    if (preset) { setWidth(preset.width); setHeight(preset.height); }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) {
-      setFileName('');
-      setFileData(null);
-      return;
-    }
-
+  const readAsBase64 = (file: File) => new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
-      const base64 = result.split(',')[1] ?? result;
-      setFileName(file.name);
-      setFileData(base64);
+      resolve(result.split(',')[1] ?? result);
     };
-    reader.onerror = () => {
-      showToast("Falha ao ler o arquivo.", "Erro");
-    };
+    reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
+  });
+
+  const handleFilesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const list = Array.from(e.target.files ?? []);
+    if (list.length === 0) return;
+    const items: QueueItem[] = [];
+    for (const file of list) {
+      try {
+        const data = await readAsBase64(file);
+        items.push({ name: file.name, data, status: 'pending' });
+      } catch {
+        showToast(`Falha ao ler ${file.name}.`, "Erro");
+      }
+    }
+    setQueue((q) => [...q, ...items]);
+    e.target.value = '';
+  };
+
+  const handleChooseDir = async () => {
+    const dir = (await Dialogs.OpenFile({
+      Title: "Escolher pasta de saída",
+      CanChooseDirectories: true,
+      CanChooseFiles: false,
+    })) as string;
+    if (dir) setOutDir(dir);
+  };
+
+  const setStatus = (index: number, status: FileStatus) => {
+    setQueue((q) => q.map((it, i) => (i === index ? { ...it, status } : it)));
   };
 
   const handleProcess = async () => {
-    if (!fileData || !fileName) {
-      showToast("Selecione um arquivo CBZ primeiro.", "Aviso");
-      return;
-    }
-    if (width <= 0 || height <= 0) {
-      showToast("Informe largura e altura maiores que zero.", "Aviso");
-      return;
-    }
+    if (queue.length === 0) { showToast("Adicione ao menos um arquivo CBZ.", "Aviso"); return; }
+    if (!outDir) { showToast("Escolha a pasta de saída.", "Aviso"); return; }
+    if (width <= 0 || height <= 0) { showToast("Informe largura e altura maiores que zero.", "Aviso"); return; }
 
     setIsProcessing(true);
-    setProgress(0);
-    setProgressStage('');
-    setProgressMessage('');
-    try {
-      // 1. Backend processa (redimensiona) e devolve o CBZ processado
-      const processed = await CBZService.ProcessCBZ(fileName, fileData, width, height);
-      if (!processed) {
-        showToast("O backend não retornou o CBZ processado.", "Erro");
-        return;
+    let done = 0, failed = 0;
+    for (let i = 0; i < queue.length; i++) {
+      setCurrent(i);
+      setProgress(0); setProgressStage(''); setProgressMessage('');
+      setStatus(i, 'processing');
+      try {
+        const processed = await CBZService.ProcessCBZ(queue[i].name, queue[i].data, width, height);
+        if (!processed) throw new Error("sem saída do backend");
+        await CBZService.SaveCBZ(joinPath(outDir, queue[i].name), processed);
+        setStatus(i, 'done'); done++;
+      } catch (err) {
+        console.error(err);
+        setStatus(i, 'error'); failed++;
       }
-
-      // 2. Usuário escolhe onde salvar
-      const savePath = await Dialogs.SaveFile({
-        Title: "Salvar arquivo CBZ",
-        Filename: fileName.replace(/\.cbz$/i, '') + "_processado.cbz",
-        Filters: [{ DisplayName: "Comic Book Zip (*.cbz)", Pattern: "*.cbz" }],
-      });
-
-      if (!savePath) {
-        showToast("Salvamento cancelado.", "Aviso");
-        return;
-      }
-
-      // 3. Backend grava o arquivo no caminho escolhido
-      await CBZService.SaveCBZ(savePath, processed);
-      showToast(`CBZ salvo em: ${savePath}`, "Concluído");
-    } catch (err) {
-      console.error(err);
-      showToast("Erro ao processar as imagens.", "Erro");
-    } finally {
-      setIsProcessing(false);
     }
+    setCurrent(-1);
+    setIsProcessing(false);
+    showToast(`${done} concluído(s), ${failed} falha(s).`, "Concluído");
   };
 
-  const hasFile = fileName.length > 0 && fileData !== null;
-  const isButtonEnabled = hasFile && width > 0 && height > 0 && !isProcessing;
+  const canProcess = queue.length > 0 && outDir !== '' && width > 0 && height > 0 && !isProcessing;
+  const doneCount = queue.filter((q) => q.status === 'done').length;
 
   return (
     <>
       <main className="container">
         <header className="brand">
-          <h1 className="title">Ajuste e gere seu <span className="title-accent">CBZ</span></h1>
-          <p className="subtitle">
-            Informe a resolução das páginas, selecione o arquivo CBZ e clique em processar.
-          </p>
+          <h1 className="title">CBZ <span className="title-accent">Studio</span></h1>
+          <p className="subtitle">Redimensione suas HQs em lote para o Kindle — selecione os arquivos, a pasta de saída e processe um a um.</p>
         </header>
 
-        <section className="greet" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          {/* Presets de resolução */}
-          <div className="input-box">
-            <Settings2 className="input-icon" aria-hidden="true" />
-            <select
-              className="input"
-              aria-label="Preset de resolução"
-              value={presetId}
-              onChange={handlePresetChange}
-              style={{ width: '100%', appearance: 'auto' }}
-            >
-              <option value="custom">Personalizado</option>
-              {KINDLE_PRESETS.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
+        <section className="panel">
           {/* Resolução */}
-          <div style={{ display: 'flex', gap: '0.6rem' }}>
+          <div className="group">
+            <span className="group-label">Resolução</span>
             <div className="input-box">
-              <input
-                className="input"
-                type="number"
-                aria-label="Largura"
-                placeholder="Largura (px)"
-                value={width}
-                min={1}
-                onChange={(e) => { setWidth(Number(e.target.value)); setPresetId('custom'); }}
-              />
+              <Settings2 className="input-icon" aria-hidden="true" />
+              <select className="input" aria-label="Preset de resolução" value={presetId} onChange={handlePresetChange}>
+                <option value="custom">Personalizado</option>
+                {KINDLE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+              </select>
             </div>
-            <div className="input-box">
-              <input
-                className="input"
-                type="number"
-                aria-label="Altura"
-                placeholder="Altura (px)"
-                value={height}
-                min={1}
-                onChange={(e) => { setHeight(Number(e.target.value)); setPresetId('custom'); }}
-              />
+            <div className="row">
+              <div className="input-box">
+                <input className="input" type="number" aria-label="Largura" placeholder="Largura (px)" value={width} min={1}
+                  onChange={(e) => { setWidth(Number(e.target.value)); setPresetId('custom'); }} />
+              </div>
+              <div className="input-box">
+                <input className="input" type="number" aria-label="Altura" placeholder="Altura (px)" value={height} min={1}
+                  onChange={(e) => { setHeight(Number(e.target.value)); setPresetId('custom'); }} />
+              </div>
             </div>
           </div>
 
-          {/* Upload */}
-          <div className="input-box">
-            <Upload className="input-icon" aria-hidden="true" />
-            <input
-              className="input"
-              type="file"
-              accept=".cbz,application/zip"
-              aria-label="Arquivo CBZ"
-              onChange={handleFileChange}
-            />
-          </div>
-
-          {hasFile ? (
-            <div className="badge" style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-              <FileImage size={14} aria-hidden="true" />
-              {fileName}
-            </div>
-          ) : (
-            <p className="subtitle" style={{ fontSize: '0.9rem', margin: 0 }}>
-              Nenhum arquivo selecionado.
-            </p>
-          )}
-
-          {/* Processar */}
-          <button
-            className="btn"
-            disabled={!isButtonEnabled}
-            onClick={handleProcess}
-            style={{
-              opacity: isButtonEnabled ? 1 : 0.5,
-              cursor: isButtonEnabled ? 'pointer' : 'not-allowed',
-              justifyContent: 'center',
-              alignSelf: 'flex-start',
-            }}
-          >
-            {isProcessing ? (
-              <>
-                <Loader2 className="animate-spin" size={17} aria-hidden="true" />
-                Processando... {progress}%
-              </>
-            ) : (
-              'Processar e Salvar CBZ'
+          {/* Arquivos */}
+          <div className="group">
+            <span className="group-label">Arquivos CBZ</span>
+            <label className="dropzone">
+              <Images size={20} aria-hidden="true" />
+              <span>Adicionar CBZ…</span>
+              <input type="file" accept=".cbz,application/zip" multiple onChange={handleFilesChange} />
+            </label>
+            {queue.length > 0 && (
+              <ul className="file-list">
+                {queue.map((f, i) => (
+                  <li key={`${f.name}-${i}`} className={`file-item is-${f.status}${i === current ? ' is-current' : ''}`}>
+                    <span className="file-name" title={f.name}>{f.name}</span>
+                    <span className="file-status">
+                      {f.status === 'processing' && <Loader2 size={14} className="animate-spin" aria-hidden="true" />}
+                      {f.status === 'done' && <CheckCircle2 size={14} aria-hidden="true" />}
+                      {f.status === 'error' && <XCircle size={14} aria-hidden="true" />}
+                      {f.status === 'pending' && <span className="dot-pending" />}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             )}
+          </div>
+
+          {/* Pasta de saída */}
+          <div className="group">
+            <span className="group-label">Pasta de saída</span>
+            <button className="input-box folder-btn" onClick={handleChooseDir} type="button">
+              <FolderOpen className="input-icon" aria-hidden="true" />
+              <span className={`folder-path${outDir ? '' : ' is-empty'}`}>{outDir || 'Escolher pasta…'}</span>
+            </button>
+          </div>
+
+          {/* Ação */}
+          <button className="btn btn-primary" disabled={!canProcess} onClick={handleProcess}>
+            {isProcessing
+              ? <><Loader2 className="animate-spin" size={17} aria-hidden="true" /> Processando {current + 1}/{queue.length}…</>
+              : <><Play size={17} aria-hidden="true" /> Processar {queue.length > 0 ? `${queue.length} arquivo(s)` : ''}</>}
           </button>
 
-          {/* Progresso do processamento */}
-          {isProcessing && (
+          {(isProcessing || doneCount > 0) && (
             <div className="progress-box" role="status" aria-live="polite">
               <div className="progress-head">
-                <span className="progress-stage">{progressStage || 'Iniciando'}</span>
-                <span className="progress-pct">{progress}%</span>
+                <span className="progress-stage">{isProcessing ? (progressStage || 'Iniciando') : `${doneCount}/${queue.length} concluído(s)`}</span>
+                <span className="progress-pct">{isProcessing ? `${progress}%` : ''}</span>
               </div>
-              <div className="progress-track">
-                <div className="progress-bar" style={{ width: `${progress}%` }} />
-              </div>
-              <span className="progress-msg">{progressMessage}</span>
+              <div className="progress-track"><div className="progress-bar" style={{ width: isProcessing ? `${progress}%` : `${(doneCount / Math.max(queue.length, 1)) * 100}%` }} /></div>
+              {isProcessing && <span className="progress-msg">{progressMessage}</span>}
             </div>
           )}
         </section>
+
+        <footer className="footer">
+          <span className="footer-version"><FolderOutput size={14} aria-hidden="true" /> CBZ Studio</span>
+        </footer>
       </main>
 
-      {/* Toast Notification */}
       <div className="toast" ref={toastRef} role="status" aria-live="polite">
         <span className="toast-label" ref={toastLabelRef}>Status</span>
         <span aria-label="result" className="toast-msg" ref={toastMsgRef}></span>

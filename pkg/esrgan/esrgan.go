@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"sync"
 
+	"cbz-converter/pkg/ortdll"
 	modeldata "cbz-converter/pkg/real_esrgan_general_x4v3-onnx-w8a8"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -76,6 +77,11 @@ func FindLibrary() (string, error) {
 		if info, err := os.Stat(p); err == nil && !info.IsDir() {
 			return p, nil
 		}
+	}
+
+	// Fallback autocontido: extrai as DLLs embutidas no binário para um temp.
+	if p, err := ortdll.Extract(); err == nil {
+		return p, nil
 	}
 
 	return "", fmt.Errorf("onnxruntime.dll não encontrada (procurei: %v). "+
