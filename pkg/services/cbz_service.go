@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,7 +17,7 @@ import (
 	"time"
 
 	"cbz-converter/pkg/esrgan"
-	"cbz-converter/pkg/retarget"
+	"cbz-converter/pkg/seamcarve"
 	"github.com/wailsapp/wails/v3/pkg/application"
 
 	// Decoders extras para formatos de imagem suportados (webp, bmp, tiff, gif)
@@ -26,6 +28,11 @@ import (
 
 // CBZService centraliza a lógica de manipular arquivos CBZ
 type CBZService struct{}
+
+// brightnessGamma é o fator de correção gama aplicado à página após o ajuste de
+// resolução, para compensar um leve escurecimento do pipeline (seam carving +
+// re-encode JPEG). Valores > 1 clareiam (ex.: 1.05 clareia ~+2 em luminância).
+const brightnessGamma = 1.05
 
 // ExtractedCBZ contém o resultado da extração para retornar ao frontend
 type ExtractedCBZ struct {
@@ -246,7 +253,8 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 
 			if width > srcW || height > srcH {
 				// Resolução alvo maior que a do arquivo: Real-ESRGAN (4x) para
-				// upscaling e depois ajuste para caber na resolução final.
+				// upscaling e depois ajuste para preencher exatamente a resolução
+				// alvo (sem distorcer nem deixar margens).
 				action = "melhorando qualidade"
 				w := <-free
 				upscaled, err := esr.UpscaleOne(img, w)
@@ -259,11 +267,12 @@ func (s *CBZService) ProcessCBZ(fileName string, fileData []byte, width int, hei
 					mu.Unlock()
 					return
 				}
-				resized = retarget.Fit(upscaled, width, height)
+				resized = seamcarve.Cover(upscaled, width, height)
 			} else {
 				// Resolução alvo menor ou igual à do arquivo: ajuste direto.
-				resized = retarget.Fit(img, width, height)
+				resized = seamcarve.Cover(img, width, height)
 			}
+			resized = lighten(resized, brightnessGamma)
 
 			results[i] = resized
 
@@ -380,4 +389,39 @@ func isImageFile(filename string) bool {
 	default:
 		return false
 	}
+}
+
+// lighten aplica uma correção gama (gama > 1 clareia, < 1 escurece) a cada
+// canal RGB da imagem, compensando o leve escurecimento do pipeline. Preserva
+// o canal alfa e o contraste (apenas desloca o ponto médio).
+func lighten(img image.Image, gamma float64) image.Image {
+	if gamma <= 0 || gamma == 1 {
+		return img
+	}
+	b := img.Bounds()
+	dst := image.NewNRGBA(b)
+	inv := 1.0 / gamma
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			dst.SetNRGBA(x, y, color.NRGBA{
+				R: clamp8(255 * math.Pow(float64(c.R)/255, inv)),
+				G: clamp8(255 * math.Pow(float64(c.G)/255, inv)),
+				B: clamp8(255 * math.Pow(float64(c.B)/255, inv)),
+				A: c.A,
+			})
+		}
+	}
+	return dst
+}
+
+// clamp8 arredonda um float em [0,255] para uint8, saturando nas bordas.
+func clamp8(v float64) uint8 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return uint8(math.Round(v))
 }

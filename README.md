@@ -82,8 +82,10 @@ wails3 build
 - `pkg/real_esrgan_general_x4v3-onnx-w8a8/` — modelo embutido via `go:embed`
   (quantizado w8a8, uint8; `.onnx` + pesos externos `.data`; ambos são gravados
   em disco no mesmo diretório antes de onnxruntime carregar).
-- `pkg/retarget/` — ajuste à resolução alvo: trata o alvo como limite máximo e
-  redimensiona a página uniformemente para caber nele (sem crop, sem barras).
+- `pkg/seamcarve/` — ajuste de aspect ratio content-aware: `Cover` preenche o
+  alvo exato (interpolação uniforme quando o aspect coincide, senão cover-scale +
+  seam carving do excedente), protegendo objetos longos como a lâmina de uma
+  foice via máscara de estrutura automática.
 - `pkg/ortdll/` — embute `onnxruntime.dll` (DirectML) no executável e extrai em
   runtime, tornando o app autocontido (sem DLLs ao lado).
 - `frontend/` — UI em React/TS; `App.tsx` orquestra o fluxo e chama o backend
