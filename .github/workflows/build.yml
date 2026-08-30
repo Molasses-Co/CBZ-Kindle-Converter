@@ -60,11 +60,23 @@ jobs:
           : > "$MF"
 
       # O `wails3 build` gera também o instalador NSIS; sem o makensis o passo
-      # "package" falha. Instala via Chocolatey (shim entra no PATH automaticamente).
+      # "package" falha. Instala via Chocolatey e garante que o diretório do
+      # makensis entre no PATH (GITHUB_PATH persiste para os passos seguintes,
+      # inclusive o que roda dentro da wails3-build-action). Sem isso o shim do
+      # choco fica no PATH, mas 'makensis' (Program Files (x86)\NSIS) não.
       - name: Install NSIS (Windows installer)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install nsis --yes --no-progress
+        run: |
+          choco install nsis --yes --no-progress
+          $nsis = "${env:ProgramFiles(x86)}\NSIS"
+          if (Test-Path "$nsis\makensis.exe") {
+            "$nsis" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "Added $nsis to GITHUB_PATH"
+          } else {
+            Write-Host "NSIS not found at $nsis"
+            exit 1
+          }
 
       - uses: ToQuery/wails3-build-action@wails-v3
         with:
